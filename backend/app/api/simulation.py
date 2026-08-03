@@ -338,7 +338,15 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
         # - completed: 运行完成，说明准备早就完成了
         # - stopped: 已停止，说明准备早就完成了
         # - failed: 运行失败（但准备是完成的）
-        prepared_statuses = ["ready", "preparing", "running", "completed", "stopped", "failed"]
+        prepared_statuses = [
+            "ready",
+            "preparing",
+            "running",
+            "interactive_ready",
+            "completed",
+            "stopped",
+            "failed",
+        ]
         if status in prepared_statuses and config_generated:
             # 获取文件统计信息
             profiles_file = os.path.join(simulation_dir, "reddit_profiles.json")
@@ -1610,6 +1618,7 @@ def start_simulation():
                     and run_state.runner_status in {
                         RunnerStatus.RUNNING,
                         RunnerStatus.PAUSED,
+                        RunnerStatus.INTERACTIVE_READY,
                         RunnerStatus.STOPPING,
                         RunnerStatus.FAILED,
                     }
@@ -1618,6 +1627,7 @@ def start_simulation():
                         in {
                             RunnerStatus.RUNNING,
                             RunnerStatus.PAUSED,
+                            RunnerStatus.INTERACTIVE_READY,
                             RunnerStatus.STOPPING,
                         }
                         or updater is not None
@@ -2779,6 +2789,7 @@ def get_env_status():
             }), 400
 
         env_alive = SimulationRunner.check_env_alive(simulation_id)
+        run_state = SimulationRunner.get_run_state(simulation_id)
         
         # 获取更详细的状态信息
         env_status = SimulationRunner.get_env_status_detail(simulation_id)
@@ -2793,6 +2804,23 @@ def get_env_status():
             "data": {
                 "simulation_id": simulation_id,
                 "env_alive": env_alive,
+                "runner_status": (
+                    run_state.runner_status.value if run_state else "idle"
+                ),
+                "report_ready": bool(
+                    run_state
+                    and run_state.runner_status
+                    in {
+                        RunnerStatus.INTERACTIVE_READY,
+                        RunnerStatus.COMPLETED,
+                        RunnerStatus.STOPPED,
+                    }
+                ),
+                "interaction_ready": bool(
+                    run_state
+                    and run_state.runner_status
+                    == RunnerStatus.INTERACTIVE_READY
+                ),
                 "twitter_available": env_status.get("twitter_available", False),
                 "reddit_available": env_status.get("reddit_available", False),
                 "message": message

@@ -4,8 +4,11 @@ import pytest
 
 from app.utils.openai_chat_compat import (
     create_chat_completion,
+    deepseek_v4_request_options,
     extract_chat_completion_text,
+    is_deepseek_v4_family,
     is_gpt5_family,
+    strip_internal_protocol_markers,
 )
 
 
@@ -90,6 +93,47 @@ def test_provider_error_is_propagated_without_guessing_or_retrying():
     assert len(recorder.calls) == 1
 
 
+def test_deepseek_v4_disables_thinking_for_protocol_sensitive_calls():
+    recorder = CompletionRecorder()
+    messages = [{"role": "user", "content": "Return JSON"}]
+
+    create_chat_completion(
+        client_for(recorder),
+        model="deepseek-v4-flash",
+        messages=messages,
+        response_format={"type": "json_object"},
+        thinking_mode="disabled",
+    )
+
+    assert recorder.calls == [
+        {
+            "model": "deepseek-v4-flash",
+            "messages": messages,
+            "response_format": {"type": "json_object"},
+            "extra_body": {"thinking": {"type": "disabled"}},
+        }
+    ]
+
+
+def test_deepseek_v4_final_writing_enables_low_effort_thinking():
+    assert deepseek_v4_request_options(
+        "deepseek-v4-pro",
+        thinking_mode="enabled",
+        reasoning_effort="low",
+    ) == {
+        "extra_body": {"thinking": {"type": "enabled"}},
+        "reasoning_effort": "low",
+    }
+
+
+def test_non_deepseek_model_does_not_receive_provider_specific_options():
+    assert deepseek_v4_request_options(
+        "gpt-4.1",
+        thinking_mode="enabled",
+        reasoning_effort="low",
+    ) == {}
+
+
 @pytest.mark.parametrize(
     ("model", "expected"),
     [
@@ -102,6 +146,20 @@ def test_provider_error_is_propagated_without_guessing_or_retrying():
 )
 def test_gpt5_family_detection(model, expected):
     assert is_gpt5_family(model) is expected
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("deepseek-v4-flash", True),
+        (" DeepSeek-V4-Pro ", True),
+        ("deepseek-chat", False),
+        ("my-deepseek-v4-proxy", False),
+        (None, False),
+    ],
+)
+def test_deepseek_v4_family_detection(model, expected):
+    assert is_deepseek_v4_family(model) is expected
 
 
 def test_extracts_text_from_supported_content_shapes():
@@ -121,3 +179,11 @@ def test_extracts_text_from_supported_content_shapes():
 
     assert extract_chat_completion_text(response) == "first second third"
     assert extract_chat_completion_text(SimpleNamespace(choices=[])) == ""
+
+
+def test_strips_leaked_deepseek_dsml_markers():
+    content = "before\n<｜｜DSML｜｜>\n<<｜｜DSML｜｜>>\nafter"
+
+    assert "DSML" not in strip_internal_protocol_markers(content)
+    assert strip_internal_protocol_markers(content).startswith("before")
+    assert strip_internal_protocol_markers(content).endswith("after")

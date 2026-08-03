@@ -511,19 +511,21 @@ const fetchRunStatus = async () => {
         prevRedditRound.value = data.reddit_current_round
       }
       
-      // 检测模拟是否已完成（通过 runner_status 或平台完成状态判断）
+      // 后端仅在平台动作结束且 GraphRAG 写入排空后发布可报告状态。
+      // interactive_ready 表示 OASIS 环境仍在线，可供报告和 Step 5 采访。
+      const isInteractiveReady = data.runner_status === 'interactive_ready'
       const isCompleted = data.runner_status === 'completed' || data.runner_status === 'stopped'
       const isFailed = data.runner_status === 'failed'
       
-      // runner_status is authoritative because the backend only publishes a
-      // terminal state after the Zep ingestion barrier has completed.
+      // runner_status is authoritative because report-ready states are only
+      // published after the Zep ingestion barrier has completed.
       if (isFailed) {
         addLog(t('log.simFailed') + (data.error ? `: ${data.error}` : ''))
         phase.value = 2
         stopPolling()
         emit('update-status', 'error')
-      } else if (isCompleted) {
-        addLog(t('log.simCompleted'))
+      } else if (isInteractiveReady || isCompleted) {
+        addLog(isInteractiveReady ? t('log.simInteractiveReady') : t('log.simCompleted'))
         phase.value = 2
         stopPolling()
         emit('update-status', 'completed')
@@ -532,30 +534,6 @@ const fetchRunStatus = async () => {
   } catch (err) {
     console.warn('获取运行状态失败:', err)
   }
-}
-
-// 检查所有启用的平台是否已完成
-const checkPlatformsCompleted = (data) => {
-  // 如果没有任何平台数据，返回 false
-  if (!data) return false
-  
-  // 检查各平台的完成状态
-  const twitterCompleted = data.twitter_completed === true
-  const redditCompleted = data.reddit_completed === true
-  
-  // 如果至少有一个平台完成了，检查是否所有启用的平台都完成了
-  // 通过 actions_count 判断平台是否被启用（如果 count > 0 或 running 曾为 true）
-  const twitterEnabled = (data.twitter_actions_count > 0) || data.twitter_running || twitterCompleted
-  const redditEnabled = (data.reddit_actions_count > 0) || data.reddit_running || redditCompleted
-  
-  // 如果没有任何平台被启用，返回 false
-  if (!twitterEnabled && !redditEnabled) return false
-  
-  // 检查所有启用的平台是否都已完成
-  if (twitterEnabled && !twitterCompleted) return false
-  if (redditEnabled && !redditCompleted) return false
-  
-  return true
 }
 
 const fetchRunStatusDetail = async () => {

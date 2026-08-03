@@ -8,6 +8,7 @@ from app.api import graph as graph_api
 from app.api import simulation as simulation_api
 from app.models.project import Project, ProjectStatus
 from app.services.simulation_manager import SimulationStatus
+from app.services.simulation_runner import RunnerStatus
 from app.models.task import TaskStatus
 
 
@@ -90,6 +91,36 @@ def test_project_reset_refuses_a_graph_with_an_active_simulation(monkeypatch):
 
     assert status == 409
     assert "sim-active" in body["error"]
+
+
+def test_interactive_ready_environment_keeps_graph_in_use(monkeypatch):
+    simulation = SimpleNamespace(
+        simulation_id="sim-interactive",
+        graph_id="graph-1",
+    )
+    monkeypatch.setattr(
+        graph_api.ZepGraphMemoryManager,
+        "get_simulation_ids_for_graph",
+        classmethod(lambda _cls, _graph_id: []),
+    )
+    monkeypatch.setattr(
+        graph_api,
+        "SimulationManager",
+        lambda: SimpleNamespace(list_simulations=lambda: [simulation]),
+    )
+    monkeypatch.setattr(
+        graph_api.SimulationRunner,
+        "get_run_state",
+        classmethod(
+            lambda _cls, _simulation_id: SimpleNamespace(
+                runner_status=RunnerStatus.INTERACTIVE_READY
+            )
+        ),
+    )
+
+    assert graph_api._active_graph_consumers("graph-1") == [
+        "sim-interactive"
+    ]
 
 
 def test_graph_delete_cannot_discard_an_updater_during_finalization(monkeypatch):

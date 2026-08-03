@@ -538,6 +538,7 @@
     "stopException": "Stop error: {error}",
     "allPlatformsCompleted": "✓ All platform simulations have ended",
     "simCompleted": "✓ Simulation completed",
+    "simInteractiveReady": "✓ Simulation and graph ingestion completed; the environment remains online for reports and interviews",
     "simFailed": "✗ Simulation failed",
     "reportRequestSent": "Report generation request sent, please wait...",
     "startingReportGen": "Starting report generation...",

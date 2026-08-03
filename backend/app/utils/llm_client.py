@@ -10,7 +10,11 @@ from typing import Optional, Dict, Any, List
 from openai import OpenAI
 
 from ..config import Config
-from .openai_chat_compat import create_chat_completion, extract_chat_completion_text
+from .openai_chat_compat import (
+    ThinkingMode,
+    create_chat_completion,
+    extract_chat_completion_text,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -71,6 +75,9 @@ def _clean_chat_text(content: str) -> str:
     cleaned = cleaned.lstrip("\ufeff")
     cleaned = re.sub(r'^```(?:json)?\s*\n?', '', cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r'\n?```\s*$', '', cleaned)
+    # Removing a repeated internal protocol marker can leave thousands of
+    # blank lines.  Bound that noise before parsing or persisting the text.
+    cleaned = re.sub(r'(?:[ \t]*\r?\n){3,}', '\n\n', cleaned)
     return cleaned.strip()
 
 
@@ -116,6 +123,8 @@ class LLMClient:
         temperature: Optional[float],
         max_tokens: Optional[int],
         response_format: Optional[Dict[str, Any]],
+        thinking_mode: Optional[ThinkingMode] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> Any:
         """Send one raw Chat Completions request through the compatibility layer."""
 
@@ -126,6 +135,8 @@ class LLMClient:
             temperature=temperature,
             max_tokens=max_tokens,
             response_format=response_format,
+            thinking_mode=thinking_mode,
+            reasoning_effort=reasoning_effort,
         )
     
     def chat(
@@ -133,7 +144,10 @@ class LLMClient:
         messages: List[Dict[str, str]],
         temperature: float = 0.7,
         max_tokens: Optional[int] = 4096,
-        response_format: Optional[Dict] = None
+        response_format: Optional[Dict] = None,
+        thinking_mode: Optional[ThinkingMode] = None,
+        reasoning_effort: Optional[str] = None,
+        fallback_to_non_thinking: bool = False,
     ) -> str:
         """
         发送聊天请求
@@ -143,6 +157,9 @@ class LLMClient:
             temperature: 温度参数
             max_tokens: 最大token数
             response_format: 响应格式（如JSON模式）
+            thinking_mode: DeepSeek V4 思考模式；其他模型会忽略
+            reasoning_effort: DeepSeek V4 思考强度
+            fallback_to_non_thinking: 思考响应不可用时，关闭思考重试一次
             
         Returns:
             模型响应文本
@@ -152,9 +169,27 @@ class LLMClient:
             temperature=temperature,
             max_tokens=max_tokens,
             response_format=response_format,
+            thinking_mode=thinking_mode,
+            reasoning_effort=reasoning_effort,
         )
-        content = extract_chat_completion_text(response)
-        return _clean_chat_text(content)
+        try:
+            return self._parse_text_response(response)
+        except LLMResponseError:
+            if not fallback_to_non_thinking or thinking_mode != "enabled":
+                raise
+            logger.warning(
+                "Thinking-mode response was unusable; retrying once with "
+                "DeepSeek thinking disabled"
+            )
+            response = self._create_completion(
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                response_format=response_format,
+                thinking_mode="disabled",
+                reasoning_effort=None,
+            )
+            return self._parse_text_response(response)
     
     def chat_json(
         self,
@@ -193,6 +228,10 @@ class LLMClient:
                         temperature=temperature,
                         max_tokens=request_max_tokens,
                         response_format=response_format,
+                        # JSON and schema-sensitive calls need deterministic
+                        # protocol output, not an additional hidden reasoning
+                        # pass that shares the completion-token budget.
+                        thinking_mode="disabled",
                     )
                 except Exception as error:
                     if (
@@ -230,6 +269,33 @@ class LLMClient:
         if last_error is not None:  # pragma: no cover - defensive loop guard
             raise last_error
         raise LLMResponseError("LLM did not produce a JSON response")
+
+    @staticmethod
+    def _parse_text_response(response: Any) -> str:
+        choices = getattr(response, "choices", None) or []
+        if not choices:
+            raise LLMResponseError("LLM returned no choices")
+
+        choice = choices[0]
+        finish_reason = getattr(choice, "finish_reason", None)
+        if finish_reason == "length":
+            raise LLMResponseError(
+                "LLM text output was truncated at the token limit",
+                finish_reason=finish_reason,
+            )
+        if finish_reason not in {None, "stop"}:
+            raise LLMResponseError(
+                f"LLM text generation stopped unexpectedly ({finish_reason})",
+                finish_reason=finish_reason,
+            )
+
+        content = _clean_chat_text(extract_chat_completion_text(response))
+        if not content:
+            raise LLMResponseError(
+                "LLM returned empty text content",
+                finish_reason=finish_reason,
+            )
+        return content
 
     @staticmethod
     def _parse_json_response(response: Any) -> Dict[str, Any]:

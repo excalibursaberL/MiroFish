@@ -96,23 +96,25 @@ def generate_report():
                 "success": False,
                 "error": (
                     "Simulation or Zep graph ingestion is still active; "
-                    "wait for a terminal run status before generating a report"
+                    "wait for a report-ready run status before generating a "
+                    "report"
                 ),
                 "ingestion_pending": updater is not None,
             }), 409
-        successful_terminal_statuses = {
+        report_ready_statuses = {
+            RunnerStatus.INTERACTIVE_READY,
             RunnerStatus.COMPLETED,
             RunnerStatus.STOPPED,
         }
         if (
             run_state is None
-            or run_state.runner_status not in successful_terminal_statuses
+            or run_state.runner_status not in report_ready_statuses
         ):
             return jsonify({
                 "success": False,
                 "error": (
-                    "A successfully completed or stopped simulation is required "
-                    "before generating a report"
+                    "An interactive-ready, successfully completed or stopped "
+                    "simulation is required before generating a report"
                 ),
             }), 409
 
@@ -191,20 +193,21 @@ def generate_report():
                     "success": False,
                     "error": (
                         "Simulation or Zep graph ingestion became active; "
-                        "retry after it reaches a terminal state"
+                        "retry after it reaches a report-ready state"
                     ),
                     "ingestion_pending": refreshed_updater is not None,
                 }), 409
             if (
                 refreshed_run_state is None
                 or refreshed_run_state.runner_status
-                not in successful_terminal_statuses
+                not in report_ready_statuses
             ):
                 return jsonify({
                     "success": False,
                     "error": (
-                        "A successfully completed or stopped simulation is "
-                        "required before generating a report"
+                        "An interactive-ready, successfully completed or "
+                        "stopped simulation is required before generating a "
+                        "report"
                     ),
                 }), 409
 

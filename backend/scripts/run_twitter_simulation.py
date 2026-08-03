@@ -38,6 +38,8 @@ sys.path.insert(0, _backend_dir)
 
 # 加载项目根目录的 .env 文件（包含 LLM_API_KEY 等配置）
 from dotenv import load_dotenv
+from app.utils.openai_chat_compat import deepseek_v4_request_options
+
 _env_file = os.path.join(_project_root, '.env')
 if os.path.exists(_env_file):
     load_dotenv(_env_file)
@@ -457,6 +459,10 @@ class TwitterSimulationRunner:
         return ModelFactory.create(
             model_platform=ModelPlatformType.OPENAI,
             model_type=llm_model,
+            model_config_dict=deepseek_v4_request_options(
+                llm_model,
+                thinking_mode="disabled",
+            ) or None,
         )
     
     def _get_active_agents_for_round(

@@ -538,6 +538,7 @@
     "stopException": "停止异常: {error}",
     "allPlatformsCompleted": "✓ 检测到所有平台模拟已结束",
     "simCompleted": "✓ 模拟已完成",
+    "simInteractiveReady": "✓ 模拟与图谱写入已完成，环境保持在线，可生成报告和进行采访",
     "simFailed": "✗ 模拟失败",
     "reportRequestSent": "报告生成请求已发送，请稍候...",
     "startingReportGen": "正在启动报告生成...",

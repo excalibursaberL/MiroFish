@@ -62,6 +62,7 @@ def _active_graph_consumers(graph_id: str) -> list[str]:
         RunnerStatus.STARTING,
         RunnerStatus.RUNNING,
         RunnerStatus.PAUSED,
+        RunnerStatus.INTERACTIVE_READY,
         RunnerStatus.STOPPING,
     }
     for simulation in SimulationManager().list_simulations():

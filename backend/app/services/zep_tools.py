@@ -1724,7 +1724,10 @@ class ZepToolsService:
                     {"role": "user", "content": user_prompt}
                 ],
                 temperature=0.3,
-                max_tokens=800
+                max_tokens=2048,
+                thinking_mode="enabled",
+                reasoning_effort="low",
+                fallback_to_non_thinking=True,
             )
             return summary
             

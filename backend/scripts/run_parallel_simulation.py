@@ -91,6 +91,8 @@ sys.path.insert(0, _backend_dir)
 
 # 加载项目根目录的 .env 文件（包含 LLM_API_KEY 等配置）
 from dotenv import load_dotenv
+from app.utils.openai_chat_compat import deepseek_v4_request_options
+
 _env_file = os.path.join(_project_root, '.env')
 if os.path.exists(_env_file):
     load_dotenv(_env_file)
@@ -1034,6 +1036,13 @@ def create_model(config: Dict[str, Any], use_boost: bool = False):
     return ModelFactory.create(
         model_platform=ModelPlatformType.OPENAI,
         model_type=llm_model,
+        # OASIS action selection is a structured tool-routing task.  Disable
+        # DeepSeek's additional hidden reasoning layer so CAMEL receives a
+        # stable action/tool payload.
+        model_config_dict=deepseek_v4_request_options(
+            llm_model,
+            thinking_mode="disabled",
+        ) or None,
     )
 
 

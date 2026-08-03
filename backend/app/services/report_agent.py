@@ -1340,11 +1340,17 @@ class ReportAgent:
                     t('progress.deepSearchAndWrite', current=tool_calls_count, max=self.MAX_TOOL_CALLS_PER_SECTION)
                 )
             
-            # 调用LLM
+            # 工具路由属于协议敏感调用，关闭 DeepSeek 内置思考；当已有
+            # 足够证据、进入成文阶段后再启用低强度思考。若思考响应被
+            # 截断或退化为内部标记，LLMClient 会关闭思考重试一次。
+            final_writing_phase = tool_calls_count >= min_tool_calls
             response = self.llm.chat(
                 messages=messages,
                 temperature=0.5,
-                max_tokens=4096
+                max_tokens=8192 if final_writing_phase else 4096,
+                thinking_mode="enabled" if final_writing_phase else "disabled",
+                reasoning_effort="low" if final_writing_phase else None,
+                fallback_to_non_thinking=final_writing_phase,
             )
 
             # 检查 LLM 返回是否为 None（API 异常或内容为空）
@@ -1550,7 +1556,10 @@ class ReportAgent:
         response = self.llm.chat(
             messages=messages,
             temperature=0.5,
-            max_tokens=4096
+            max_tokens=8192,
+            thinking_mode="enabled",
+            reasoning_effort="low",
+            fallback_to_non_thinking=True,
         )
 
         # 检查强制收尾时 LLM 返回是否为 None
@@ -1871,7 +1880,8 @@ class ReportAgent:
         for iteration in range(max_iterations):
             response = self.llm.chat(
                 messages=messages,
-                temperature=0.5
+                temperature=0.5,
+                thinking_mode="disabled",
             )
             
             # 解析工具调用
@@ -1913,7 +1923,11 @@ class ReportAgent:
         # 达到最大迭代，获取最终响应
         final_response = self.llm.chat(
             messages=messages,
-            temperature=0.5
+            temperature=0.5,
+            max_tokens=8192,
+            thinking_mode="enabled",
+            reasoning_effort="low",
+            fallback_to_non_thinking=True,
         )
         
         # 清理响应

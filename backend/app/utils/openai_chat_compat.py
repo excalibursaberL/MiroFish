@@ -7,7 +7,18 @@ gracefully adapting request parameters for GPT-5 family models.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import re
+from typing import Any, Dict, List, Literal, Optional
+
+
+ThinkingMode = Literal["enabled", "disabled"]
+
+_VALID_THINKING_MODES = {"enabled", "disabled"}
+_VALID_REASONING_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
+_DSML_MARKER_RE = re.compile(
+    r"<+[|｜]+\s*DSML\s*[|｜]+>+",
+    flags=re.IGNORECASE,
+)
 
 
 def is_gpt5_family(model: Optional[str]) -> bool:
@@ -15,6 +26,53 @@ def is_gpt5_family(model: Optional[str]) -> bool:
     if not model:
         return False
     return model.strip().lower().startswith("gpt-5")
+
+
+def is_deepseek_v4_family(model: Optional[str]) -> bool:
+    """Return True for the DeepSeek V4 model aliases exposed by its API."""
+    if not model:
+        return False
+    return model.strip().lower().startswith("deepseek-v4-")
+
+
+def deepseek_v4_request_options(
+    model: Optional[str],
+    *,
+    thinking_mode: Optional[ThinkingMode] = None,
+    reasoning_effort: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build DeepSeek-only request options without affecting other providers.
+
+    DeepSeek V4 defaults to thinking mode.  MiroFish disables it for
+    protocol-sensitive JSON/tool-routing calls and enables it explicitly for
+    final prose generation.  These options can also be passed to CAMEL's
+    ``model_config_dict`` because it forwards them to OpenAI-compatible calls.
+    """
+
+    if thinking_mode is not None and thinking_mode not in _VALID_THINKING_MODES:
+        raise ValueError(f"Unsupported thinking mode: {thinking_mode}")
+    if (
+        reasoning_effort is not None
+        and reasoning_effort not in _VALID_REASONING_EFFORTS
+    ):
+        raise ValueError(f"Unsupported reasoning effort: {reasoning_effort}")
+    if not is_deepseek_v4_family(model) or thinking_mode is None:
+        return {}
+
+    options: Dict[str, Any] = {
+        "extra_body": {"thinking": {"type": thinking_mode}},
+    }
+    if thinking_mode == "enabled" and reasoning_effort is not None:
+        options["reasoning_effort"] = reasoning_effort
+    return options
+
+
+def strip_internal_protocol_markers(content: str) -> str:
+    """Remove leaked DeepSeek transport markers from user-visible text."""
+
+    if not isinstance(content, str) or "DSML" not in content.upper():
+        return content
+    return _DSML_MARKER_RE.sub("", content)
 
 
 def create_chat_completion(
@@ -25,6 +83,8 @@ def create_chat_completion(
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     response_format: Optional[Dict[str, Any]] = None,
+    thinking_mode: Optional[ThinkingMode] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> Any:
     """
     Create a chat completion with model-specific request parameters.
@@ -54,6 +114,14 @@ def create_chat_completion(
         else:
             kwargs["max_tokens"] = max_tokens
 
+    kwargs.update(
+        deepseek_v4_request_options(
+            model,
+            thinking_mode=thinking_mode,
+            reasoning_effort=reasoning_effort,
+        )
+    )
+
     return client.chat.completions.create(**kwargs)
 
 
@@ -70,7 +138,7 @@ def extract_chat_completion_text(response: Any) -> str:
     content = getattr(message, "content", "")
 
     if isinstance(content, str):
-        return content
+        return strip_internal_protocol_markers(content)
 
     if isinstance(content, list):
         chunks: List[str] = []
@@ -96,6 +164,6 @@ def extract_chat_completion_text(response: Any) -> str:
             if isinstance(content_obj, str):
                 chunks.append(content_obj)
 
-        return "".join(chunks).strip()
+        return strip_internal_protocol_markers("".join(chunks)).strip()
 
-    return str(content or "")
+    return strip_internal_protocol_markers(str(content or ""))

@@ -43,6 +43,9 @@ class RunnerStatus(str, Enum):
     STARTING = "starting"
     RUNNING = "running"
     PAUSED = "paused"
+    # The social simulation and graph ingestion are complete, while the
+    # OASIS process remains alive to serve report/user interview commands.
+    INTERACTIVE_READY = "interactive_ready"
     STOPPING = "stopping"
     STOPPED = "stopped"
     COMPLETED = "completed"
@@ -144,6 +147,7 @@ class SimulationRunState:
     # 时间戳
     started_at: Optional[str] = None
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    interactive_ready_at: Optional[str] = None
     completed_at: Optional[str] = None
     
     # 错误信息
@@ -188,7 +192,16 @@ class SimulationRunState:
             "total_actions_count": self.twitter_actions_count + self.reddit_actions_count,
             "started_at": self.started_at,
             "updated_at": self.updated_at,
+            "interactive_ready_at": self.interactive_ready_at,
             "completed_at": self.completed_at,
+            "report_ready": self.runner_status in {
+                RunnerStatus.INTERACTIVE_READY,
+                RunnerStatus.STOPPED,
+                RunnerStatus.COMPLETED,
+            },
+            "interaction_ready": (
+                self.runner_status == RunnerStatus.INTERACTIVE_READY
+            ),
             "error": self.error,
             "process_pid": self.process_pid,
         }
@@ -258,6 +271,7 @@ class SimulationRunner:
 
         status_map = {
             RunnerStatus.RUNNING: SimulationStatus.RUNNING,
+            RunnerStatus.INTERACTIVE_READY: SimulationStatus.INTERACTIVE_READY,
             RunnerStatus.STOPPING: SimulationStatus.STOPPING,
             RunnerStatus.STOPPED: SimulationStatus.STOPPED,
             RunnerStatus.COMPLETED: SimulationStatus.COMPLETED,
@@ -328,6 +342,7 @@ class SimulationRunner:
                 reddit_actions_count=data.get("reddit_actions_count", 0),
                 started_at=data.get("started_at"),
                 updated_at=data.get("updated_at", datetime.now().isoformat()),
+                interactive_ready_at=data.get("interactive_ready_at"),
                 completed_at=data.get("completed_at"),
                 error=data.get("error"),
                 process_pid=data.get("process_pid"),
@@ -429,6 +444,7 @@ class SimulationRunner:
                 RunnerStatus.STARTING,
                 RunnerStatus.RUNNING,
                 RunnerStatus.PAUSED,
+                RunnerStatus.INTERACTIVE_READY,
                 RunnerStatus.STOPPING,
             }
             if (
@@ -762,6 +778,84 @@ class SimulationRunner:
                 except Exception:
                     pass
                 cls._stderr_files.pop(simulation_id, None)
+
+    @classmethod
+    def _publish_interactive_ready(cls, state: SimulationRunState) -> bool:
+        """Drain graph writes and expose the still-live environment for use.
+
+        Platform ``simulation_end`` events mean no more social actions will be
+        produced.  Interviews are read-only OASIS commands, so the graph
+        updater can be drained and removed without terminating the child
+        process.  Reports are admitted only after this transition succeeds.
+        """
+
+        if state.runner_status == RunnerStatus.INTERACTIVE_READY:
+            return True
+        if (
+            state.runner_status != RunnerStatus.RUNNING
+            or not cls._check_all_platforms_completed(state)
+        ):
+            return False
+
+        simulation_id = state.simulation_id
+        with cls._finalization_lock(simulation_id):
+            if state.runner_status == RunnerStatus.INTERACTIVE_READY:
+                return True
+            if (
+                state.runner_status != RunnerStatus.RUNNING
+                or not cls._check_all_platforms_completed(state)
+            ):
+                return False
+
+            updater_retained = (
+                ZepGraphMemoryManager.get_updater(simulation_id) is not None
+            )
+            graph_memory_enabled = cls._graph_memory_enabled.get(
+                simulation_id, False
+            )
+            if graph_memory_enabled or updater_retained:
+                try:
+                    ZepGraphMemoryManager.stop_updater(simulation_id)
+                    cls._graph_memory_enabled.pop(simulation_id, None)
+                    logger.info(
+                        "模拟图谱写入已排空，环境继续等待采访: "
+                        "simulation_id=%s",
+                        simulation_id,
+                    )
+                except Exception as error:
+                    state.runner_status = RunnerStatus.FAILED
+                    state.error = f"Zep图谱写入未完整完成: {error}"
+                    state.updated_at = datetime.now().isoformat()
+                    cls._save_run_state(state)
+                    cls._sync_simulation_status(
+                        simulation_id,
+                        RunnerStatus.FAILED,
+                        state.error,
+                    )
+                    logger.error(
+                        "模拟无法进入可交互状态: simulation_id=%s, error=%s",
+                        simulation_id,
+                        error,
+                    )
+                    return False
+            else:
+                cls._graph_memory_enabled.pop(simulation_id, None)
+
+            ready_at = datetime.now().isoformat()
+            state.runner_status = RunnerStatus.INTERACTIVE_READY
+            state.interactive_ready_at = ready_at
+            state.updated_at = ready_at
+            state.error = None
+            cls._save_run_state(state)
+            cls._sync_simulation_status(
+                simulation_id,
+                RunnerStatus.INTERACTIVE_READY,
+            )
+            logger.info(
+                "模拟已进入可交互状态: simulation_id=%s",
+                simulation_id,
+            )
+            return True
     
     @classmethod
     def _read_action_log(
@@ -818,14 +912,11 @@ class SimulationRunner:
                                     # 如果运行了两个平台，需要两个都完成
                                     all_completed = cls._check_all_platforms_completed(state)
                                     if all_completed:
-                                        # Platform completion is only an input
-                                        # signal. The monitor publishes the
-                                        # terminal status after the process has
-                                        # exited and Zep ingestion has drained.
                                         logger.info(
-                                            f"所有平台已结束，等待进程与图谱写入完成: "
+                                            f"所有平台已结束，正在排空图谱写入: "
                                             f"{state.simulation_id}"
                                         )
+                                        cls._publish_interactive_ready(state)
                                 
                                 # 更新轮次信息（从 round_end 事件）
                                 elif event_type == "round_end":
@@ -984,6 +1075,7 @@ class SimulationRunner:
                     RunnerStatus.STARTING,
                     RunnerStatus.RUNNING,
                     RunnerStatus.PAUSED,
+                    RunnerStatus.INTERACTIVE_READY,
                     RunnerStatus.STOPPING,
                 ]
                 and not retrying_finalization
@@ -1492,6 +1584,7 @@ class SimulationRunner:
                     cls._graph_memory_enabled[simulation_id] = True
                     if state.runner_status in {
                         RunnerStatus.IDLE,
+                        RunnerStatus.INTERACTIVE_READY,
                         RunnerStatus.STOPPED,
                         RunnerStatus.COMPLETED,
                     }:
@@ -1511,6 +1604,7 @@ class SimulationRunner:
                         RunnerStatus.STARTING,
                         RunnerStatus.RUNNING,
                         RunnerStatus.PAUSED,
+                        RunnerStatus.INTERACTIVE_READY,
                         RunnerStatus.STOPPING,
                     }
                 )

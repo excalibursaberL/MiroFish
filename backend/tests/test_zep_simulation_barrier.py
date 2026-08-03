@@ -55,7 +55,7 @@ def test_manual_stop_surfaces_graph_ingestion_failure(monkeypatch):
         SimulationRunner._manual_stop_requests.discard("sim-1")
 
 
-def test_platform_completion_does_not_publish_terminal_success_before_barrier(
+def test_platform_completion_publishes_interactive_ready_without_graph_updater(
     monkeypatch, tmp_path
 ):
     simulation_id = "sim-1"
@@ -72,11 +72,154 @@ def test_platform_completion_does_not_publish_terminal_success_before_barrier(
         runner_status=RunnerStatus.RUNNING,
         twitter_running=True,
     )
+    monkeypatch.setattr(
+        SimulationRunner,
+        "_sync_simulation_status",
+        classmethod(lambda _cls, *_args, **_kwargs: None),
+    )
+    SimulationRunner._graph_memory_enabled[simulation_id] = False
 
-    SimulationRunner._read_action_log(str(log_path), 0, state, "twitter")
+    try:
+        SimulationRunner._read_action_log(str(log_path), 0, state, "twitter")
 
-    assert state.twitter_completed is True
-    assert state.runner_status == RunnerStatus.RUNNING
+        assert state.twitter_completed is True
+        assert state.runner_status == RunnerStatus.INTERACTIVE_READY
+        assert state.interactive_ready_at is not None
+        assert state.to_dict()["report_ready"] is True
+        assert state.to_dict()["interaction_ready"] is True
+    finally:
+        SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
+
+
+def test_interactive_ready_is_published_only_after_graph_drain(
+    monkeypatch, tmp_path
+):
+    simulation_id = "sim-interactive"
+    sim_dir = tmp_path / simulation_id / "twitter"
+    sim_dir.mkdir(parents=True)
+    log_path = sim_dir / "actions.jsonl"
+    log_path.write_text(
+        '{"event_type":"simulation_end","total_rounds":1,"total_actions":0}\n',
+        encoding="utf-8",
+    )
+    state = SimulationRunState(
+        simulation_id=simulation_id,
+        runner_status=RunnerStatus.RUNNING,
+        twitter_running=True,
+    )
+    updater = object()
+    observed_statuses = []
+
+    monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        SimulationRunner,
+        "_sync_simulation_status",
+        classmethod(lambda _cls, *_args, **_kwargs: None),
+    )
+    monkeypatch.setattr(
+        runner_module.ZepGraphMemoryManager,
+        "get_updater",
+        classmethod(lambda _cls, _simulation_id: updater),
+    )
+    monkeypatch.setattr(
+        runner_module.ZepGraphMemoryManager,
+        "stop_updater",
+        classmethod(
+            lambda _cls, _simulation_id: observed_statuses.append(
+                state.runner_status
+            )
+        ),
+    )
+    SimulationRunner._graph_memory_enabled[simulation_id] = True
+
+    try:
+        SimulationRunner._read_action_log(str(log_path), 0, state, "twitter")
+
+        assert observed_statuses == [RunnerStatus.RUNNING]
+        assert state.runner_status == RunnerStatus.INTERACTIVE_READY
+        assert simulation_id not in SimulationRunner._graph_memory_enabled
+    finally:
+        SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
+
+
+def test_graph_drain_failure_prevents_interactive_ready(monkeypatch, tmp_path):
+    simulation_id = "sim-interactive-failure"
+    sim_dir = tmp_path / simulation_id / "twitter"
+    sim_dir.mkdir(parents=True)
+    log_path = sim_dir / "actions.jsonl"
+    log_path.write_text(
+        '{"event_type":"simulation_end","total_rounds":1,"total_actions":0}\n',
+        encoding="utf-8",
+    )
+    state = SimulationRunState(
+        simulation_id=simulation_id,
+        runner_status=RunnerStatus.RUNNING,
+        twitter_running=True,
+    )
+
+    monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        SimulationRunner,
+        "_sync_simulation_status",
+        classmethod(lambda _cls, *_args, **_kwargs: None),
+    )
+    monkeypatch.setattr(
+        runner_module.ZepGraphMemoryManager,
+        "get_updater",
+        classmethod(lambda _cls, _simulation_id: object()),
+    )
+    monkeypatch.setattr(
+        runner_module.ZepGraphMemoryManager,
+        "stop_updater",
+        classmethod(
+            lambda _cls, _simulation_id: (_ for _ in ()).throw(
+                RuntimeError("drain incomplete")
+            )
+        ),
+    )
+    SimulationRunner._graph_memory_enabled[simulation_id] = True
+
+    try:
+        SimulationRunner._read_action_log(str(log_path), 0, state, "twitter")
+
+        assert state.runner_status == RunnerStatus.FAILED
+        assert "drain incomplete" in state.error
+        assert SimulationRunner._graph_memory_enabled[simulation_id] is True
+    finally:
+        SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
+
+
+def test_manual_stop_accepts_interactive_ready_state(monkeypatch):
+    simulation_id = "sim-close-interactive"
+    state = SimulationRunState(
+        simulation_id=simulation_id,
+        runner_status=RunnerStatus.INTERACTIVE_READY,
+    )
+    monkeypatch.setattr(
+        SimulationRunner,
+        "get_run_state",
+        classmethod(lambda _cls, _simulation_id: state),
+    )
+    monkeypatch.setattr(
+        SimulationRunner,
+        "_save_run_state",
+        classmethod(lambda _cls, _state: None),
+    )
+    monkeypatch.setattr(
+        SimulationRunner,
+        "_sync_simulation_status",
+        classmethod(lambda _cls, *_args, **_kwargs: None),
+    )
+    SimulationRunner._processes.pop(simulation_id, None)
+    SimulationRunner._monitor_threads.pop(simulation_id, None)
+    SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
+
+    try:
+        result = SimulationRunner.stop_simulation(simulation_id)
+
+        assert result.runner_status == RunnerStatus.STOPPED
+    finally:
+        SimulationRunner._manual_stop_requests.discard(simulation_id)
 
 
 def test_manual_stop_timeout_leaves_monitor_owned_state_stopping(monkeypatch):
