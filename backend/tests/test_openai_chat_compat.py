@@ -5,7 +5,9 @@ import pytest
 from app.utils.openai_chat_compat import (
     create_chat_completion,
     deepseek_v4_request_options,
+    extract_chat_completion_finish_reason,
     extract_chat_completion_text,
+    has_chat_completion_reasoning_content,
     is_deepseek_v4_family,
     is_gpt5_family,
     strip_internal_protocol_markers,
@@ -179,6 +181,30 @@ def test_extracts_text_from_supported_content_shapes():
 
     assert extract_chat_completion_text(response) == "first second third"
     assert extract_chat_completion_text(SimpleNamespace(choices=[])) == ""
+
+
+def test_extracts_finish_reason_from_supported_choice_shapes():
+    assert extract_chat_completion_finish_reason(
+        SimpleNamespace(choices=[SimpleNamespace(finish_reason="length")])
+    ) == "length"
+    assert extract_chat_completion_finish_reason(
+        SimpleNamespace(choices=[{"finish_reason": "stop"}])
+    ) == "stop"
+    assert extract_chat_completion_finish_reason(SimpleNamespace(choices=[])) is None
+
+
+def test_detects_reasoning_content_without_exposing_it():
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="",
+                    reasoning_content="internal reasoning",
+                )
+            )
+        ]
+    )
+    assert has_chat_completion_reasoning_content(response) is True
 
 
 def test_strips_leaked_deepseek_dsml_markers():

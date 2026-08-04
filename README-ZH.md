@@ -101,7 +101,7 @@ MiroFish 致力于打造映射现实的群体智能镜像，通过捕捉个体�
 |------|---------|------|---------|
 | **Node.js** | 18+ | 前端运行环境，包含 npm | `node -v` |
 | **Python** | ≥3.11, ≤3.12 | 后端运行环境 | `python --version` |
-| **uv** | 最新版 | Python 包管理器 | `uv --version` |
+| **uv** | 推荐最新版 | Python 包管理器；如果已有 `backend/.venv`，可不安装 | `uv --version` |
 
 #### 1. 配置环境变量
 
@@ -142,6 +142,13 @@ npm run setup
 
 # 安装 Python 依赖（后端，自动创建虚拟环境）
 npm run setup:backend
+```
+
+如果 Windows 环境没有 `uv`，但仓库中已有 `backend/.venv`，可以直接运行 `npm run dev`。根目录启动脚本会优先使用这个项目虚拟环境。若虚拟环境也不存在，可手动创建并安装依赖：
+
+```powershell
+python -m venv backend\.venv
+backend\.venv\Scripts\python.exe -m pip install -r backend\requirements.txt
 ```
 
 #### 3. 启动服务

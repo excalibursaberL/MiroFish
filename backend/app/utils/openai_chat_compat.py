@@ -167,3 +167,33 @@ def extract_chat_completion_text(response: Any) -> str:
         return strip_internal_protocol_markers("".join(chunks)).strip()
 
     return strip_internal_protocol_markers(str(content or ""))
+
+
+def extract_chat_completion_finish_reason(response: Any) -> Optional[str]:
+    """Return the provider finish reason for the first choice, when present."""
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return None
+    choice = choices[0]
+    if isinstance(choice, dict):
+        reason = choice.get("finish_reason")
+    else:
+        reason = getattr(choice, "finish_reason", None)
+    return str(reason) if reason is not None else None
+
+
+def has_chat_completion_reasoning_content(response: Any) -> bool:
+    """Return whether the first response message contains hidden reasoning text."""
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return False
+    choice = choices[0]
+    if isinstance(choice, dict):
+        message = choice.get("message") or {}
+        if not isinstance(message, dict):
+            return False
+        reasoning = message.get("reasoning_content")
+    else:
+        message = getattr(choice, "message", None)
+        reasoning = getattr(message, "reasoning_content", None)
+    return bool(reasoning)

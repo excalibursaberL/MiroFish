@@ -4,6 +4,7 @@
     <nav class="navbar">
       <div class="nav-brand">MIROFISH</div>
       <div class="nav-links">
+        <button class="finance-link" type="button" @click="router.push('/finance/c0')">A股 C0 实验</button>
         <LanguageSwitcher />
         <a href="https://github.com/666ghj/MiroFish" target="_blank" class="github-link">
           {{ $t('nav.visitGithub') }} <span class="arrow">↗</span>
@@ -358,6 +359,23 @@ const startSimulation = () => {
   display: flex;
   align-items: center;
   gap: 16px;
+}
+
+.finance-link {
+  min-height: 34px;
+  padding: 6px 12px;
+  color: #ffffff;
+  background: #245f49;
+  border: 1px solid #4e8a72;
+  border-radius: 3px;
+  font-family: var(--font-cn);
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.finance-link:hover {
+  background: #2f755a;
 }
 
 .github-link {

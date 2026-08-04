@@ -44,6 +44,10 @@ class Config:
     # OASIS模拟配置
     OASIS_DEFAULT_MAX_ROUNDS = int(os.environ.get('OASIS_DEFAULT_MAX_ROUNDS', '10'))
     OASIS_SIMULATION_DATA_DIR = os.path.join(os.path.dirname(__file__), '../uploads/simulations')
+
+    # Financial adaptation artifacts (anonymous snapshots, C0 prompts,
+    # profiles, and independent forecast records).
+    FINANCE_ADAPTER_DATA_DIR = os.path.join(os.path.dirname(__file__), '../uploads/finance')
     
     # OASIS平台可用动作配置
     OASIS_TWITTER_ACTIONS = [
