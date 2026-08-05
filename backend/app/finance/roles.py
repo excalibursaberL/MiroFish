@@ -1,8 +1,15 @@
-"""Deterministic C0 investor roles.
+"""Deterministic, minimal investor profiles for the C0 experiment.
 
-The 17:3 composition follows the current experiment plan. It is an
-experimental voice allocation, not a claim that it exactly reproduces the
-number of people or the capital held by each market group.
+The population mix is an experimental voice allocation: 17 retail voices and
+3 institutional voices.  Retail margins for knowledge, risk attitude,
+investment horizon, and decision source are taken from the SIPF 2019 survey.
+The fundamental/technical split is borrowed from TwinMarket as an explicitly
+synthetic experimental prior, not as a claim about the real A-share population.
+
+Only the fields relevant to event-based price-direction forecasting are put in
+the C0 prompt.  Trading-account and social-propagation fields remain in the
+profile record for later S1/trading experiments but are deliberately inactive
+in C0.
 """
 
 from __future__ import annotations
@@ -12,6 +19,7 @@ from typing import Any, Dict, List
 
 
 C0_AGENT_COUNT = 20
+PROFILE_VERSION = "survey2019_twinmarket_minimal_v1"
 
 
 @dataclass(frozen=True)
@@ -49,8 +57,8 @@ C0_ROLE_TEMPLATES = (
         category="institution",
         label="被动与风险控制机构投资者",
         description=(
-            "重视流动性、下行风险和不确定性，倾向于在证据不足时降低"
-            "置信度，而不是追逐单一叙事。"
+            "重视流动性、下行风险和不确定性，证据不足时降低置信度，"
+            "而不是追逐单一叙事。"
         ),
         count=1,
     ),
@@ -87,40 +95,230 @@ C0_ROLE_TEMPLATES = (
 )
 
 
+# These are the survey margins used in Agent占比分析.md.  Keeping them in
+# code makes the generated profiles reproducible and auditable.
+RETAIL_MARGIN_COUNTS = {
+    "knowledge_level": {"experienced": 6, "basic": 8, "novice": 3},
+    "risk_attitude": {"low": 3, "medium": 10, "high": 3, "very_high": 1},
+    "investment_horizon": {"long": 9, "mixed": 6, "short": 2},
+    "decision_source": {
+        "self_analysis": 11,
+        "friends": 3,
+        "online_expert": 1,
+        "advisor": 2,
+    },
+    # TwinMarket's synthetic strategy distribution is approximately 40/60.
+    # This is a controlled prior for analysis-style diversity, not a survey
+    # estimate of the A-share population.
+    "analysis_style": {"fundamental": 7, "technical": 10},
+}
+
+
+_RETAIL_PERMUTATIONS = {
+    "risk_attitude": (10, 9, 16, 4, 11, 1, 8, 12, 6, 13, 0, 7, 14, 3, 2, 5, 15),
+    "investment_horizon": (4, 12, 1, 9, 16, 6, 14, 3, 11, 0, 8, 15, 5, 13, 2, 10, 7),
+    "decision_source": (1, 8, 15, 3, 10, 0, 7, 14, 5, 12, 2, 9, 16, 4, 11, 6, 13),
+    "analysis_style": (0, 8, 16, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 15, 11, 7, 3),
+}
+
+
+def _expand_counts(counts: Dict[str, int]) -> List[str]:
+    values: List[str] = []
+    for label, count in counts.items():
+        values.extend([label] * count)
+    return values
+
+
+def _spread_margin(field: str) -> List[str]:
+    values = _expand_counts(RETAIL_MARGIN_COUNTS[field])
+    permutation = _RETAIL_PERMUTATIONS[field]
+    if len(values) != len(permutation):
+        raise RuntimeError(f"invalid retail margin for {field}")
+    if sorted(permutation) != list(range(len(values))):
+        raise RuntimeError(f"invalid retail permutation for {field}")
+    return [values[index] for index in permutation]
+
+
+_RETAIL_ASSIGNMENTS = {
+    field: _spread_margin(field)
+    for field in RETAIL_MARGIN_COUNTS
+    if field != "knowledge_level"
+}
+
+
+_INSTITUTION_ASSIGNMENTS = {
+    "institutional_active": {
+        "knowledge_level": "professional",
+        "analysis_style": "fundamental",
+        "risk_attitude": "medium",
+        "investment_horizon": "long",
+        "decision_source": "self_analysis",
+        "social_role": "institutional",
+    },
+    "institutional_quant": {
+        "knowledge_level": "professional",
+        "analysis_style": "technical",
+        "risk_attitude": "high",
+        "investment_horizon": "mixed",
+        "decision_source": "self_analysis",
+        "social_role": "institutional",
+    },
+    "institutional_risk": {
+        "knowledge_level": "professional",
+        "analysis_style": "risk_control",
+        "risk_attitude": "low",
+        "investment_horizon": "long",
+        "decision_source": "self_analysis",
+        "social_role": "institutional",
+    },
+}
+
+
+_RETAIL_ROLE_TO_KNOWLEDGE = {
+    "retail_mature": "experienced",
+    "retail_basic": "basic",
+    "retail_novice": "novice",
+}
+
+
+_KNOWLEDGE_LABELS = {
+    "experienced": "熟悉投资",
+    "basic": "具备基本知识",
+    "novice": "新手",
+    "professional": "专业机构研究人员",
+}
+_ANALYSIS_LABELS = {
+    "fundamental": "基本面与事件分析",
+    "technical": "技术与价格行为分析",
+    "risk_control": "风险控制与流动性分析",
+}
+_ANALYSIS_GUIDANCE = {
+    "fundamental": (
+        "优先比较公告事实、业绩和业务影响，同时检查正负证据是否相互矛盾。"
+    ),
+    "technical": (
+        "优先关注输入中明确给出的时间、价格行为或热度信号；如果没有提供"
+        "K 线或技术指标，不得编造均线、MACD、成交量等数据。"
+    ),
+    "risk_control": (
+        "优先检查信息缺口、下行风险和事件兑现条件，证据不足时降低置信度。"
+    ),
+}
+_RISK_LABELS = {
+    "low": "低风险",
+    "medium": "中等风险",
+    "high": "高风险",
+    "very_high": "极高风险/投机",
+}
+_HORIZON_LABELS = {
+    "long": "较长期",
+    "mixed": "中期或混合期限",
+    "short": "较短期",
+}
+
+
+def _retail_assignment(index: int, field: str) -> str:
+    try:
+        return _RETAIL_ASSIGNMENTS[field][index]
+    except (KeyError, IndexError) as exc:
+        raise RuntimeError(f"invalid retail assignment {field}[{index}]") from exc
+
+
 def iter_c0_roles() -> List[Dict[str, Any]]:
     """Expand role templates to the 20 deterministic investor records."""
     roles: List[Dict[str, Any]] = []
     next_id = 0
+    retail_index = 0
     for template in C0_ROLE_TEMPLATES:
         for ordinal in range(1, template.count + 1):
-            roles.append(
-                {
-                    "agent_id": next_id,
-                    "agent_key": f"investor_{next_id + 1:03d}",
-                    "role_id": template.role_id,
-                    "role_category": template.category,
-                    "role_label": template.label,
-                    "role_description": template.description,
-                    "role_ordinal": ordinal,
-                }
-            )
+            role = {
+                "agent_id": next_id,
+                "agent_key": f"investor_{next_id + 1:03d}",
+                "role_id": template.role_id,
+                "role_category": template.category,
+                "role_label": template.label,
+                "role_description": template.description,
+                "role_ordinal": ordinal,
+            }
+            if template.category == "institution":
+                role.update(_INSTITUTION_ASSIGNMENTS[template.role_id])
+            else:
+                role.update(
+                    {
+                        "knowledge_level": _RETAIL_ROLE_TO_KNOWLEDGE[template.role_id],
+                        "analysis_style": _retail_assignment(
+                            retail_index, "analysis_style"
+                        ),
+                        "risk_attitude": _retail_assignment(
+                            retail_index, "risk_attitude"
+                        ),
+                        "investment_horizon": _retail_assignment(
+                            retail_index, "investment_horizon"
+                        ),
+                        "decision_source": _retail_assignment(
+                            retail_index, "decision_source"
+                        ),
+                        "social_role": "ordinary",
+                    }
+                )
+                retail_index += 1
+            roles.append(role)
             next_id += 1
     if len(roles) != C0_AGENT_COUNT:
         raise RuntimeError(f"C0 role configuration must contain {C0_AGENT_COUNT} agents")
+    if retail_index != 17:
+        raise RuntimeError("C0 role configuration must contain 17 retail agents")
     return roles
 
 
-def build_c0_profiles() -> List[Dict[str, Any]]:
-    """Create profiles compatible with the existing OASIS profile files.
+def profile_prompt_text(profile: Dict[str, Any]) -> str:
+    """Render only the stable C0 fields into a compact prompt section."""
+    return (
+        "- 知识水平：{knowledge}\n"
+        "- 分析方式：{analysis}\n"
+        "- 分析规则：{analysis_guidance}\n"
+        "- 风险态度：{risk}\n"
+        "- 投资期限：{horizon}\n"
+        "\n"
+        "画像使用边界：风险态度只影响你对不确定性和下行风险的容忍度，"
+        "投资期限只影响你理解信息时的关注重点；二者都不能预先决定股票涨跌。"
+        "无论你的个人投资期限如何，都必须回答题目指定的预测 horizon。"
+    ).format(
+        knowledge=_KNOWLEDGE_LABELS[profile["knowledge_level"]],
+        analysis=_ANALYSIS_LABELS[profile["analysis_style"]],
+        analysis_guidance=_ANALYSIS_GUIDANCE[profile["analysis_style"]],
+        risk=_RISK_LABELS[profile["risk_attitude"]],
+        horizon=_HORIZON_LABELS[profile["investment_horizon"]],
+    )
 
-    C0 does not start an OASIS social environment, but using the same profile
-    shape keeps the adapter plug-and-play for a later S1 implementation.
-    """
+
+def build_c0_profiles() -> List[Dict[str, Any]]:
+    """Create anonymized OASIS-compatible profiles for C0 and later S1 use."""
     profiles: List[Dict[str, Any]] = []
     for role in iter_c0_roles():
         name = role["agent_key"]
+        profile_text = profile_prompt_text(role)
+        if role["role_category"] == "institution":
+            profile_sources = {
+                "knowledge_level": "institutional_role_design",
+                "risk_attitude": "institutional_role_design",
+                "investment_horizon": "institutional_role_design",
+                "decision_source": "institutional_role_design_S1_only",
+                "analysis_style": "institutional_role_design",
+            }
+        else:
+            profile_sources = {
+                "knowledge_level": "SIPF_2019_natural_person_survey",
+                "risk_attitude": "SIPF_2019_natural_person_survey",
+                "investment_horizon": "SIPF_2019_natural_person_survey",
+                "decision_source": "SIPF_2019_natural_person_survey_S1_only",
+                "analysis_style": (
+                    "TwinMarket_strategy_category_40_60_experimental_prior"
+                ),
+            }
         persona = (
-            f"你是{role['role_label']}，编号为{name}。{role['role_description']}"
+            f"你是{role['role_label']}，编号为{name}。{role['role_description']}\n"
+            f"固定行为画像：\n{profile_text}\n"
             "本轮属于 C0 独立判断组。你不能看到其他投资者的帖子、预测、"
             "回复或任何聚合意见，只能依据给定的历史事件和当前公开事件作答。"
         )
@@ -142,6 +340,16 @@ def build_c0_profiles() -> List[Dict[str, Any]]:
                 "role_label": role["role_label"],
                 "role_description": role["role_description"],
                 "role_ordinal": role["role_ordinal"],
+                "knowledge_level": role["knowledge_level"],
+                "analysis_style": role["analysis_style"],
+                "risk_attitude": role["risk_attitude"],
+                "investment_horizon": role["investment_horizon"],
+                # Reserved for S1; this field is not rendered in the C0
+                # prompt because C0 has no social information to follow.
+                "decision_source": role["decision_source"],
+                "social_role": role["social_role"],
+                "profile_version": PROFILE_VERSION,
+                "profile_sources": profile_sources,
             }
         )
     return profiles

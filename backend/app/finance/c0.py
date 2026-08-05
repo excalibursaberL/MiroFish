@@ -30,12 +30,27 @@ from ..utils.openai_chat_compat import (
 )
 from ..utils.logger import get_logger
 from .dataset import FinancialDatasetLoader, FinancialScenario
-from .evaluator import FinancialOutcomeEvaluator
+from .evaluator import (
+    FIVE_DAY_DIRECTION_DEFINITION,
+    FIVE_DAY_NEUTRAL_THRESHOLD,
+    FinancialOutcomeEvaluator,
+)
 from .models import C0Forecast
-from .roles import C0_AGENT_COUNT, build_c0_profiles
+from .roles import C0_AGENT_COUNT, build_c0_profiles, profile_prompt_text
 
 
 logger = get_logger("mirofish.finance.c0")
+
+
+def _forecast_profile_fields(profile: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy active profile metadata into researcher-facing forecast records."""
+    return {
+        "agent_knowledge_level": profile.get("knowledge_level"),
+        "agent_analysis_style": profile.get("analysis_style"),
+        "agent_risk_attitude": profile.get("risk_attitude"),
+        "agent_investment_horizon": profile.get("investment_horizon"),
+        "profile_version": profile.get("profile_version"),
+    }
 
 
 class C0ExperimentService:
@@ -59,6 +74,11 @@ class C0ExperimentService:
         "agent_role",
         "agent_role_category",
         "agent_role_label",
+        "agent_knowledge_level",
+        "agent_analysis_style",
+        "agent_risk_attitude",
+        "agent_investment_horizon",
+        "profile_version",
         "as_of",
         "horizon",
         "direction",
@@ -81,6 +101,8 @@ class C0ExperimentService:
         "actual_astock_label",
         "actual_astock_direction",
         "actual_astock_change_return",
+        "five_day_neutral_threshold",
+        "five_day_direction_definition",
         "actual_five_day_close_direction",
         "actual_five_day_close_return",
         "five_day_direction_correct",
@@ -178,6 +200,12 @@ class C0ExperimentService:
             "group": self.GROUP,
             "run_mode": run_mode,
             "social_interaction": False,
+            "prediction_target": {
+                "horizon": "next_5_trading_days",
+                "return_definition": "R5 = close5 / original_price - 1",
+                "neutral_threshold": FIVE_DAY_NEUTRAL_THRESHOLD,
+                "direction_definition": FIVE_DAY_DIRECTION_DEFINITION,
+            },
             "dataset_path": str(loader.dataset_path),
             "scenario_count": len(scenarios),
             "scenario_ids": [scenario.scenario_id for scenario in scenarios],
@@ -210,18 +238,27 @@ class C0ExperimentService:
         profile: Dict[str, Any],
     ) -> tuple[str, str]:
         """Build the same two-message contract for every independent Agent."""
-        system_prompt = (
-            "你是一个用于研究的 A 股市场投资者 Agent。你现在属于 C0 独立判断组。"
-            "C0 的关键要求是：不能读取、猜测或引用其他投资者的帖子、预测、回复、"
-            "聚合意见或社会互动结果；只能依据本条 Prompt 中给出的信息作答。"
-            "不要调用外部搜索，不要补充输入之外的企业身份或事实。"
-            "响应必须是一个可被 json.loads 解析的单个 JSON object，且只能输出 json，"
-            "不要使用 Markdown 代码围栏或 JSON 之外的文字。"
-            '示例 json 输出：{"direction":"neutral","up_probability":0.2,'
-            '"neutral_probability":0.6,"down_probability":0.2,'
-            '"expected_return":0.0,"confidence":0.5,'
-            '"evidence_event_ids":[],"reason":"依据有限信息作出判断"}。'
-        )
+        neutral_threshold_percent = f"{FIVE_DAY_NEUTRAL_THRESHOLD * 100:.1f}%"
+        system_prompt = f"""你是一个用于研究的 A 股市场投资者 Agent。你现在属于 C0 独立判断组。
+
+## 固定行为画像
+{profile_prompt_text(profile)}
+
+## C0 信息边界
+C0 的关键要求是：不能读取、猜测或引用其他投资者的帖子、预测、回复、聚合意见或社会互动结果；只能依据本条 Prompt 中给出的信息作答。
+不要调用外部搜索，不要补充输入之外的企业身份或事实。Profile 中的 decision_source 和 social_role 仅为后续 S1 保留，C0 不得据此假设已经看到任何社会观点。
+
+## 五日预测标签（必须严格遵守）
+目标收益 R5 是从当前截止点到未来第 5 个交易日收盘的累计收益率。请按以下固定区间选择 direction：
+- R5 < -{neutral_threshold_percent}：down
+- -{neutral_threshold_percent} <= R5 <= +{neutral_threshold_percent}：neutral
+- R5 > +{neutral_threshold_percent}：up
+neutral 只表示预计五日价格变化很小，不表示“信息矛盾”或“无法判断”。如果没有把握，请降低 confidence 并让三个概率更接近，而不要仅因为不确定就选择 neutral。
+expected_return 必须使用小数收益率，例如 0.02 表示 +2%，并与 direction 所在区间保持一致。
+
+## 输出格式
+响应必须是一个可被 json.loads 解析的单个 JSON object，且只能输出 json，不要使用 Markdown 代码围栏或 JSON 之外的文字。
+示例 json 输出：{{"direction":"neutral","up_probability":0.2,"neutral_probability":0.6,"down_probability":0.2,"expected_return":0.0,"confidence":0.5,"evidence_event_ids":[],"reason":"依据有限信息作出判断"}}。"""
 
         seed_lines = []
         for index, event in enumerate(scenario.seed_events, start=1):
@@ -245,6 +282,7 @@ class C0ExperimentService:
 - role_id: {profile['role_id']}
 - role: {profile['role_label']}
 - role_description: {profile['role_description']}
+- profile_version: {profile['profile_version']}
 
 ## 预测对象
 - scenario_id: {scenario.scenario_id}
@@ -261,7 +299,7 @@ event_id={current.get('event_id', '')} | event_time={current.get('event_time', '
 文本：{current.get('text', '')}
 READ={current.get('read', '')} MARKET={current.get('market', '')}
 
-请独立预测当前事件之后的股价反应。只预测方向和相对收益，不要预测绝对价格，也不要把“事件是否发生”作为目标。请只输出一个合法的 json 对象，格式如下：
+请独立预测当前事件之后未来 5 个交易日的累计收盘收益。只预测方向和相对收益，不要预测绝对价格，也不要把“事件是否发生”作为目标。方向必须使用上文固定的 ±{neutral_threshold_percent} 区间；不确定性使用 confidence 和三个概率表达。请只输出一个合法的 json 对象，格式如下：
 {{
   "direction": "up|neutral|down",
   "up_probability": 0.0,
@@ -589,6 +627,7 @@ READ={current.get('read', '')} MARKET={current.get('market', '')}
                     agent_role_label=profile["role_label"],
                     as_of=scenario.prediction_cutoff,
                     horizon=scenario.horizon,
+                    **_forecast_profile_fields(profile),
                     raw_response=raw_response,
                     status="error",
                     error=str(error),
@@ -726,6 +765,7 @@ READ={current.get('read', '')} MARKET={current.get('market', '')}
                 agent_role_label=profile["role_label"],
                 as_of=scenario.prediction_cutoff,
                 horizon=scenario.horizon,
+                **_forecast_profile_fields(profile),
                 direction=direction,
                 up_probability=up,
                 neutral_probability=neutral,
@@ -749,6 +789,7 @@ READ={current.get('read', '')} MARKET={current.get('market', '')}
                 agent_role_label=profile["role_label"],
                 as_of=scenario.prediction_cutoff,
                 horizon=scenario.horizon,
+                **_forecast_profile_fields(profile),
                 raw_response=raw_response,
                 status="parse_error",
                 error=str(error),
@@ -1010,6 +1051,12 @@ READ={current.get('read', '')} MARKET={current.get('market', '')}
                     "actual_astock_label": outcome["astock_label"],
                     "actual_astock_direction": outcome["astock_direction"],
                     "actual_astock_change_return": outcome["astock_change_return"],
+                    "five_day_neutral_threshold": outcome[
+                        "five_day_neutral_threshold"
+                    ],
+                    "five_day_direction_definition": outcome[
+                        "five_day_direction_definition"
+                    ],
                     "actual_five_day_close_direction": outcome[
                         "five_day_close_direction"
                     ],

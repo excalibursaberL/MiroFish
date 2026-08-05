@@ -11,7 +11,10 @@ from app.api import finance_bp
 from app.api import finance as finance_api
 from app.finance.c0 import C0ExperimentService
 from app.finance.dataset import DatasetValidationError, FinancialDatasetLoader
-from app.finance.evaluator import FinancialOutcomeEvaluator
+from app.finance.evaluator import (
+    FIVE_DAY_NEUTRAL_THRESHOLD,
+    FinancialOutcomeEvaluator,
+)
 from app.finance.models import C0Forecast
 from app.finance.roles import build_c0_profiles, iter_c0_roles
 
@@ -28,7 +31,34 @@ def test_c0_role_mix_is_fixed():
         "retail_basic": 8,
         "retail_novice": 3,
     }
-    assert len(build_c0_profiles()) == 20
+    profiles = build_c0_profiles()
+    assert len(profiles) == 20
+
+    retail = [profile for profile in profiles if profile["role_category"] != "institution"]
+    assert Counter(profile["knowledge_level"] for profile in retail) == {
+        "experienced": 6,
+        "basic": 8,
+        "novice": 3,
+    }
+    assert Counter(profile["risk_attitude"] for profile in retail) == {
+        "low": 3,
+        "medium": 10,
+        "high": 3,
+        "very_high": 1,
+    }
+    assert Counter(profile["investment_horizon"] for profile in retail) == {
+        "long": 9,
+        "mixed": 6,
+        "short": 2,
+    }
+    assert Counter(profile["analysis_style"] for profile in retail) == {
+        "fundamental": 7,
+        "technical": 10,
+    }
+    assert all(profile["profile_version"] == "survey2019_twinmarket_minimal_v1" for profile in profiles)
+    assert profiles[0]["profile_sources"]["risk_attitude"] == "institutional_role_design"
+    assert retail[0]["profile_sources"]["risk_attitude"] == "SIPF_2019_natural_person_survey"
+    assert retail[0]["profile_sources"]["analysis_style"].startswith("TwinMarket_")
 
 
 def test_default_blind_dataset_has_five_seeds():
@@ -118,6 +148,8 @@ def test_prepare_and_dry_run_do_not_call_llm(tmp_path):
     assert manifest["agent_count"] == 20
     assert manifest["scenario_count"] == 1
     assert manifest["expected_prediction_count"] == 20
+    assert manifest["prediction_target"]["neutral_threshold"] == pytest.approx(0.017)
+    assert "-1.7%" in manifest["prediction_target"]["direction_definition"]
     assert manifest["files"]["llm_responses"] == "llm_responses.jsonl"
     run_id = manifest["run_id"]
     prompt_lines = (tmp_path / run_id / "prompts.jsonl").read_text(encoding="utf-8").splitlines()
@@ -229,6 +261,8 @@ def test_all_mode_writes_prediction_and_evaluation_csv_without_network(
 
     assert len(prediction_rows) == 360
     assert len(evaluation_rows) == 360
+    assert "agent_analysis_style" in prediction_rows[0]
+    assert "agent_risk_attitude" in prediction_rows[0]
     assert Counter(row["scenario_id"] for row in prediction_rows) == {
         f"SCN_{index:03d}": 20 for index in range(1, 19)
     }
@@ -239,6 +273,10 @@ def test_all_mode_writes_prediction_and_evaluation_csv_without_network(
         "down",
     }
     assert evaluation_rows[0]["five_day_direction_correct"] in {"true", "false"}
+    assert float(evaluation_rows[0]["five_day_neutral_threshold"]) == pytest.approx(
+        0.017
+    )
+    assert "neutral" in evaluation_rows[0]["five_day_direction_definition"]
     assert service.get_csv_path(run_id, "predictions").name == "predictions.csv"
     assert service.get_csv_path(run_id, "evaluation").name == "evaluation.csv"
 
@@ -433,6 +471,8 @@ def test_forecast_parser_normalizes_percent_probabilities():
     assert forecast.status == "ok"
     assert forecast.direction == "up"
     assert forecast.agent_role_category == "institution"
+    assert forecast.agent_analysis_style == profile["analysis_style"]
+    assert forecast.agent_risk_attitude == profile["risk_attitude"]
     assert forecast.up_probability == pytest.approx(0.7)
     assert forecast.confidence == pytest.approx(0.8)
     assert forecast.evidence_event_ids == [scenario.seed_events[0]["event_id"]]
@@ -445,6 +485,36 @@ def test_scn_004_evaluator_exposes_both_result_definitions():
     assert outcome["astock_change_return"] == pytest.approx(0.0011668611435238)
     assert outcome["five_day_close_direction"] == "up"
     assert outcome["five_day_close_return"] == pytest.approx(0.04195804)
+    assert outcome["five_day_neutral_threshold"] == pytest.approx(0.017)
+
+
+@pytest.mark.parametrize(
+    ("five_day_return", "expected_direction"),
+    [
+        (-0.02, "down"),
+        (-FIVE_DAY_NEUTRAL_THRESHOLD, "neutral"),
+        (-0.001, "neutral"),
+        (0.0, "neutral"),
+        (0.001, "neutral"),
+        (FIVE_DAY_NEUTRAL_THRESHOLD, "neutral"),
+        (0.02, "up"),
+    ],
+)
+def test_five_day_direction_uses_closed_neutral_band(
+    five_day_return, expected_direction
+):
+    assert (
+        FinancialOutcomeEvaluator._sign_direction(five_day_return)
+        == expected_direction
+    )
+
+
+@pytest.mark.parametrize("scenario_id", ["SCN_002", "SCN_009", "SCN_015"])
+def test_small_five_day_moves_are_neutral(scenario_id):
+    outcome = FinancialOutcomeEvaluator().get_outcome(scenario_id)
+
+    assert abs(outcome["five_day_close_return"]) <= FIVE_DAY_NEUTRAL_THRESHOLD
+    assert outcome["five_day_close_direction"] == "neutral"
 
 
 @pytest.mark.parametrize("invalid_response", ["", '{"direction":"up"'])
@@ -534,7 +604,28 @@ def test_prompt_meets_deepseek_json_mode_contract():
     assert "json" in system_prompt
     assert "json.loads" in system_prompt
     assert '"direction":"neutral"' in system_prompt
+    assert "-1.7% <= R5 <= +1.7%：neutral" in system_prompt
+    assert "不表示“信息矛盾”或“无法判断”" in system_prompt
+    assert "未来 5 个交易日的累计收盘收益" in user_prompt
+    assert "±1.7%" in user_prompt
     assert "合法的 json 对象" in user_prompt
+
+
+def test_prompt_uses_minimal_profile_without_directional_prior():
+    service = C0ExperimentService()
+    scenario = FinancialDatasetLoader().load(limit=1)[0]
+    profile = build_c0_profiles()[4]
+    system_prompt, user_prompt = service.build_prompt(scenario, profile)
+
+    assert "固定行为画像" in system_prompt
+    assert "知识水平" in system_prompt
+    assert "风险态度" in system_prompt
+    assert "投资期限" in system_prompt
+    assert "不能预先决定股票涨跌" in system_prompt
+    assert "不得编造均线、MACD、成交量" in system_prompt
+    assert "必须回答题目指定的预测 horizon" in system_prompt
+    assert "self_analysis" not in system_prompt
+    assert profile["profile_version"] in user_prompt
 
 
 def test_finish_reason_length_is_retried(monkeypatch):

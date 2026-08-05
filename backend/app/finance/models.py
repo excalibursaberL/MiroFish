@@ -17,6 +17,11 @@ class C0Forecast:
     agent_role_label: str
     as_of: str
     horizon: str
+    agent_knowledge_level: Optional[str] = None
+    agent_analysis_style: Optional[str] = None
+    agent_risk_attitude: Optional[str] = None
+    agent_investment_horizon: Optional[str] = None
+    profile_version: Optional[str] = None
     direction: Optional[str] = None
     up_probability: Optional[float] = None
     neutral_probability: Optional[float] = None
@@ -41,6 +46,11 @@ class C0Forecast:
             "agent_role": self.agent_role,
             "agent_role_category": self.agent_role_category,
             "agent_role_label": self.agent_role_label,
+            "agent_knowledge_level": self.agent_knowledge_level,
+            "agent_analysis_style": self.agent_analysis_style,
+            "agent_risk_attitude": self.agent_risk_attitude,
+            "agent_investment_horizon": self.agent_investment_horizon,
+            "profile_version": self.profile_version,
             "as_of": self.as_of,
             "horizon": self.horizon,
             "direction": self.direction,

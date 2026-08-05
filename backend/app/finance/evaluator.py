@@ -20,6 +20,19 @@ ASTOCK_LABEL_DIRECTIONS = {
     "2": "up",
 }
 
+# Fixed before OOD evaluation.  The rounded 1.7% band is calibrated from the
+# 20th percentile of absolute five-day returns in the Astock training split.
+# Keep this value in one place so prompts and evaluator labels cannot drift.
+FIVE_DAY_NEUTRAL_THRESHOLD = 0.017
+_FIVE_DAY_NEUTRAL_PERCENT = FIVE_DAY_NEUTRAL_THRESHOLD * 100
+FIVE_DAY_DIRECTION_DEFINITION = (
+    f"down: R5 < -{_FIVE_DAY_NEUTRAL_PERCENT:.1f}%; "
+    f"neutral: -{_FIVE_DAY_NEUTRAL_PERCENT:.1f}% <= R5 "
+    f"<= {_FIVE_DAY_NEUTRAL_PERCENT:.1f}%; "
+    f"up: R5 > {_FIVE_DAY_NEUTRAL_PERCENT:.1f}%; "
+    "R5 = close5 / original_price - 1"
+)
+
 
 class FinancialOutcomeEvaluator:
     """Read hidden outcomes after an experiment has completed."""
@@ -53,6 +66,8 @@ class FinancialOutcomeEvaluator:
             "five_day_close_direction": FinancialOutcomeEvaluator._sign_direction(
                 five_day_return
             ),
+            "five_day_neutral_threshold": FIVE_DAY_NEUTRAL_THRESHOLD,
+            "five_day_direction_definition": FIVE_DAY_DIRECTION_DEFINITION,
             "normalized_original_price": original_price,
             "normalized_close5": close5,
             "daily_closes": [float(row[f"close{day}"]) for day in range(1, 6)],
@@ -63,9 +78,15 @@ class FinancialOutcomeEvaluator:
         }
 
     @staticmethod
-    def _sign_direction(value: float) -> str:
-        if value > 0:
+    def _sign_direction(
+        value: float,
+        neutral_threshold: float = FIVE_DAY_NEUTRAL_THRESHOLD,
+    ) -> str:
+        """Map a five-day return to the fixed three-class benchmark label."""
+        if neutral_threshold < 0:
+            raise ValueError("neutral threshold must be non-negative")
+        if value > neutral_threshold:
             return "up"
-        if value < 0:
+        if value < -neutral_threshold:
             return "down"
         return "neutral"

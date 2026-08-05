@@ -89,6 +89,7 @@
               <dl>
                 <div><dt>场景</dt><dd>{{ manifest.scenario_count }}</dd></div>
                 <div><dt>Agent</dt><dd>{{ manifest.agent_count }}</dd></div>
+                <div><dt>中性区间</dt><dd>±{{ formatThresholdPercent(manifest.prediction_target?.neutral_threshold) }}</dd></div>
                 <div><dt>已完成</dt><dd>{{ completedCount }}/{{ expectedCount }}</dd></div>
                 <div><dt>成功</dt><dd>{{ manifest.successful_prediction_count || 0 }}</dd></div>
                 <div><dt>失败</dt><dd>{{ manifest.failed_prediction_count || 0 }}</dd></div>
@@ -195,7 +196,7 @@
                   <b>{{ formatSignedPercent(outcome.five_day_close_return) }}</b>
                 </div>
               </div>
-              <p>Astock 的 label/CHANGE 与本实验采用的“五日端到端收盘收益”是两种不同统计口径，因此方向可能不同。</p>
+              <p>Astock 的 label/CHANGE 与本实验采用的“五日端到端收盘收益”是两种不同统计口径，因此方向可能不同。五日收益在 ±{{ formatThresholdPercent(outcome.five_day_neutral_threshold) }} 内判为中性；中性表示价格变化很小，不表示 Agent 没有把握。</p>
             </section>
 
             <div v-if="predictions.length" class="table-wrap">
@@ -529,6 +530,7 @@ const resetWorkbench = () => {
 
 const directionLabel = (direction) => ({ up: '上涨', neutral: '中性', down: '下跌' }[direction] || '—')
 const formatProbability = (value) => value === null || value === undefined ? '—' : `${Math.round(Number(value) * 100)}%`
+const formatThresholdPercent = (value) => `${((Number(value) || 0.017) * 100).toFixed(1)}%`
 const formatSignedPercent = (value) => {
   if (value === null || value === undefined) return '—'
   const number = Number(value) * 100

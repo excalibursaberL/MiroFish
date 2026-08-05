@@ -5,6 +5,8 @@
 - 支持单场景模式，以及一次运行全部 18 个匿名场景的批量模式；
 - 20 个匿名投资者 Agent；
 - 3 个机构投资者、6 个有经验散户、8 个具备基础知识的散户、3 个新手散户；
+- 17 个散户的风险态度按 `3/10/3/1`、投资期限按 `9/6/2` 分配；
+- 散户分析方式使用 TwinMarket 的技术面/基本面类别作为实验先验，按 `10/7` 分配；
 - 每个 Agent 读取同一场景的 5 个历史种子和 1 个当前公开事件；
 - 每个 Agent 单独调用一次模型；
 - 模型返回空文本、截断文本或无效 JSON 时自动重试一次，并记录 `attempt_count`；
@@ -14,8 +16,19 @@
 - `stock_factors` 保留在数据集和冻结快照中，但不写入 LLM Prompt；
 - 输出方向、三分类概率、预期收益、置信度、证据事件 ID 和理由。
 - 批量模式会在后台依次完成 `18 × 20 = 360` 次模型调用，并持续写入 CSV。
+- 五日方向采用固定的 `±1.7%` 中性区间：`R5 < -1.7%` 为下跌，`|R5| <= 1.7%` 为中性，`R5 > 1.7%` 为上涨。
 
 `C0` 暂时不创建 OASIS 社交环境，也不写入 Zep 社会互动记录。这样可以先得到没有社会互动的基线，后续 `S1` 再复用同一组 Profile 和快照，接入 OASIS 的帖子传播链路。
+
+## Agent Profile
+
+当前画像版本为 `survey2019_twinmarket_minimal_v1`。C0 Prompt 只启用 `knowledge_level`、`analysis_style`、`risk_attitude` 和 `investment_horizon`：前三类调查属性来自投保基金 2019 年自然人投资者调查的离散配额，`analysis_style` 借用 TwinMarket 的策略类别和约 `40/60` 合成比例作为实验先验。机构画像全部标注为角色设计，不写成自然人调查结果。
+
+`decision_source` 和 `social_role` 会保存在 `profiles.json` 中，但只供后续 S1 使用；C0 Prompt 明确禁止依据这两个字段假设已经看到社会观点。现金、持仓、历史收益、处置效应、换手率和交易次数不进入 C0。
+
+技术型 Agent 只能使用输入中明确提供的信息；没有 K 线或命名技术指标时，Prompt 会禁止其编造均线、MACD、成交量等数据。个人投资期限也不会改变统一的预测目标，所有 Agent 都必须回答场景指定的五日 horizon。
+
+方向标签中的 `neutral` 只表示 Agent 预计未来五日累计收益位于 `[-1.7%, +1.7%]`，不表示消息相互矛盾或 Agent 无法判断。认知上的不确定性应由较低的 `confidence` 和更分散的三分类概率表达。`expected_return` 使用小数收益率，例如 `0.02` 表示 `+2%`。阈值来源为 Astock 训练集五日绝对收益的第 20 百分位数并四舍五入为 `1.7%`；阈值在 OOD 评测前固定，不根据测试结果调整。
 
 ## 输入
 
@@ -76,7 +89,7 @@ MiroFish/backend/uploads/finance/<run_id>/
 - `scenarios.jsonl`：冻结后的安全输入快照；
 - `prompts.jsonl`：每个场景/Agent 的独立 Prompt；
 - `predictions.jsonl`：真实运行后的结构化预测。
-- `predictions.csv`：逐 Agent 预测，不包含真实答案；运行中每完成一个 Agent 就会刷新，可用于观察部分结果；
+- `predictions.csv`：逐 Agent 预测，不包含真实答案；同时记录知识水平、分析方式、风险态度、投资期限和画像版本，运行中每完成一个 Agent 就会刷新；
 - `evaluation.csv`：预测与隐藏真实结果的连接表，只在全部 Agent 完成后生成，供研究者统计准确率和收益误差；
 - `llm_responses.jsonl`：每次实际 API 尝试的完整请求和响应，包括重试、响应 ID、choices、content、reasoning_content、finish_reason、usage 和异常信息，不包含 API Key。
 
@@ -141,7 +154,7 @@ GET /api/finance/c0/<run_id>/csv/evaluation
 GET /api/finance/c0/<run_id>/outcome
 ```
 
-该接口同时返回 Astock 的原始 `label/CHANGE` 口径和未来 5 个交易日的端到端收盘收益口径。评测文件由独立 evaluator 读取，不会写入 Prompt、Profile、Zep 或 Agent 场景快照。
+该接口同时返回 Astock 的原始 `label/CHANGE` 口径和未来 5 个交易日的端到端收盘收益口径。后者通过 `R5 = close5 / original_price - 1` 计算，并使用固定 `±1.7%` 中性区间。`manifest.json`、outcome 和 `evaluation.csv` 都会记录本次使用的阈值与定义。评测文件由独立 evaluator 读取，不会写入 Prompt、Profile、Zep 或 Agent 场景快照。
 
 单场景 API 仍采用同步执行；全部场景使用当前后端进程内的后台线程顺序执行。预测 JSONL 使用单写入者追加模式，manifest 和 CSV 使用唯一临时文件及 Windows 文件占用重试，避免页面轮询或编辑器读取时触发 `WinError 5`。后端重启会将未完成任务标记为中断，研究者可手动继续已冻结的批量运行；当前仍不是自动任务队列。JSON 协议调用会关闭 DeepSeek V4 思考模式，并在空响应或解析失败时重试一次；尚未实现 S1 社会互动。
 
