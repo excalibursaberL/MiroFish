@@ -9,6 +9,8 @@ from .background import C0BackgroundRunner
 from .dataset import FinancialDatasetLoader, FinancialScenario
 from .evaluator import FinancialOutcomeEvaluator
 from .roles import C0_AGENT_COUNT, build_c0_profiles
+from .s1 import S1ExperimentService
+from .s1_batch import S1BatchRunner
 
 __all__ = [
     "C0ExperimentService",
@@ -18,4 +20,6 @@ __all__ = [
     "FinancialOutcomeEvaluator",
     "C0_AGENT_COUNT",
     "build_c0_profiles",
+    "S1ExperimentService",
+    "S1BatchRunner",
 ]

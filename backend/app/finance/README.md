@@ -1,6 +1,10 @@
-# A 股金融适配层：C0 原型
+# A 股金融适配层：C0 与 Reddit S1 原型
 
-这个目录是 MiroFish 的金融适配层。当前只实现实验计划中的 `C0` 组：
+这个目录是 MiroFish 的金融适配层。当前实现了实验计划中的独立预测基线 `C0`，以及接入 OASIS Reddit 社交主流程的 `S1` 原型。
+
+## C0：无社会互动基线
+
+`C0` 具备以下能力：
 
 - 支持单场景模式，以及一次运行全部 18 个匿名场景的批量模式；
 - 20 个匿名投资者 Agent；
@@ -18,7 +22,7 @@
 - 批量模式会在后台依次完成 `18 × 20 = 360` 次模型调用，并持续写入 CSV。
 - 五日方向采用固定的 `±1.7%` 中性区间：`R5 < -1.7%` 为下跌，`|R5| <= 1.7%` 为中性，`R5 > 1.7%` 为上涨。
 
-`C0` 暂时不创建 OASIS 社交环境，也不写入 Zep 社会互动记录。这样可以先得到没有社会互动的基线，后续 `S1` 再复用同一组 Profile 和快照，接入 OASIS 的帖子传播链路。
+`C0` 不创建 OASIS 社交环境，也不写入 Zep 社会互动记录，用来提供没有社会互动的基线。`S1` 复用同一组 Profile 和匿名场景，再将 Agent 接入帖子、评论和点赞链路。
 
 ## Agent Profile
 
@@ -156,7 +160,109 @@ GET /api/finance/c0/<run_id>/outcome
 
 该接口同时返回 Astock 的原始 `label/CHANGE` 口径和未来 5 个交易日的端到端收盘收益口径。后者通过 `R5 = close5 / original_price - 1` 计算，并使用固定 `±1.7%` 中性区间。`manifest.json`、outcome 和 `evaluation.csv` 都会记录本次使用的阈值与定义。评测文件由独立 evaluator 读取，不会写入 Prompt、Profile、Zep 或 Agent 场景快照。
 
-单场景 API 仍采用同步执行；全部场景使用当前后端进程内的后台线程顺序执行。预测 JSONL 使用单写入者追加模式，manifest 和 CSV 使用唯一临时文件及 Windows 文件占用重试，避免页面轮询或编辑器读取时触发 `WinError 5`。后端重启会将未完成任务标记为中断，研究者可手动继续已冻结的批量运行；当前仍不是自动任务队列。JSON 协议调用会关闭 DeepSeek V4 思考模式，并在空响应或解析失败时重试一次；尚未实现 S1 社会互动。
+单场景 API 仍采用同步执行；全部场景使用当前后端进程内的后台线程顺序执行。预测 JSONL 使用单写入者追加模式，manifest 和 CSV 使用唯一临时文件及 Windows 文件占用重试，避免页面轮询或编辑器读取时触发 `WinError 5`。后端重启会将未完成任务标记为中断，研究者可手动继续已冻结的批量运行；当前仍不是自动任务队列。C0 的 JSON 协议调用会关闭 DeepSeek V4 思考模式，并在空响应或解析失败时重试一次。
+
+## S1：Reddit 社会互动原型
+
+S1 固定运行一个匿名场景，包含 20 个参与预测的投资者 Agent，以及从当前场景动态解析出的信息发布账号。OASIS Reddit 会按 Profile 列表位置分配 Agent ID，因此投资者固定为 `0–19`；信息主体根据事件中实际出现的发布者从 `20` 开始连续编号，数量不再固定。
+
+一次实验执行固定顺序：`历史记忆预载 -> 当前事件公开 -> pre-social 预测 -> 社会互动 -> post-social 预测 -> 配对比较`。5 条历史种子直接写入每个投资者的只读 Profile 记忆，不再作为帖子逐轮发布，也不占互动轮数；只有当前事件由图谱解析出的信息主体发布为初始公开帖。默认社会互动为 6 轮，可在 `1–12` 轮之间设置。每轮只表示一次互动机会，不映射成现实中的分钟或交易日。这里的“五日”仅指预测目标是未来 5 个交易日累计收盘收益。
+
+pre-social 和 post-social 都采访同一套 OASIS Agent。第一次采访在当前事件发布后、任何投资者行动前完成；第二次采访在全部互动结束后完成。pre-social 无效 JSON 会在互动开始前重试一次，post-social 则只重试失败 Agent。两阶段的差异因此可以解释为社会信息暴露后的观点变化，而不是 Profile、事件输入或 Agent 实例变化。评测真值仍然只在全部预测完成后读取。
+
+正式实验推荐传入已经由 MiroFish 种子材料流程建好的 `project_id` 或 `graph_id`。S1 会复用 `ZepEntityReader` 读取图谱实体，把事件中的发布者匹配到实体 UUID，再生成受系统控制、不参与预测的信息账号。同一实体发布多条事件时只生成一个账号；事件中被提及但没有直接发布信息的实体只进入映射记录，不会自动成为发布者。图谱模式下，只要文本能够识别出发布者但图谱里找不到对应实体，准备阶段就会直接报错，避免悄悄退回虚构账号后仍被误认为正式实验。
+
+如果没有提供图谱，`source_mode=auto` 会进入明确标记的 `scenario` 回退模式，根据“某公司公告”“某媒体电”等归因语言解析发布者。无法归因的事件统一交给一个 `PUBLIC_DISCLOSURE_FEED`，不会再人为补齐公司、媒体、交易所和监管机构四类账号。回退模式适合离线调试；论文正式结果应使用图谱模式。
+
+准备一个 S1 场景（不调用 LLM）：
+
+```json
+POST /api/finance/s1/reddit/prepare
+{
+  "scenario_id": "SCN_009",
+  "project_id": "proj_xxxxxxxxxxxx",
+  "source_mode": "graph",
+  "social_rounds": 6
+}
+```
+
+也可以直接传入该项目对应的 `graph_id`：
+
+```json
+POST /api/finance/s1/reddit/prepare
+{
+  "scenario_id": "SCN_009",
+  "graph_id": "mirofish_xxxxxxxxxxxxxxxx",
+  "source_mode": "graph"
+}
+```
+
+只做离线流程测试时可以省略项目/图谱，或者显式指定 `"source_mode": "scenario"`。`auto` 在提供图谱时选择 `graph`，否则选择 `scenario`；最终选择会写入 manifest，避免混淆两类实验。
+
+读取某个匿名场景的安全事件材料（不包含 `stock_factors`、未来价格或评测答案）：
+
+```text
+GET /api/finance/s1/reddit/scenarios/<scenario_id>/seed
+```
+
+前端 S1 工作台会自动调用该接口展示 5 条历史种子和 1 条当前事件。点击“从当前事件新建图谱”时，页面将选中的事件整理为临时匿名文本，调用 MiroFish 原有的本体生成和 Zep 图谱构建接口；图谱完成后自动把新项目和 graph ID 带入 S1 准备步骤。
+
+使用返回的 `run_id` 启动后台实验：
+
+```json
+POST /api/finance/s1/reddit/run
+{
+  "run_id": "s1_reddit_xxxxxxxxxxxx"
+}
+```
+
+查询状态、预测和下载 CSV：
+
+```text
+GET /api/finance/s1/reddit/<run_id>
+GET /api/finance/s1/reddit/<run_id>/predictions
+GET /api/finance/s1/reddit/<run_id>/mapping
+GET /api/finance/s1/reddit/<run_id>/metrics
+GET /api/finance/s1/reddit/<run_id>/actions?limit=100
+GET /api/finance/s1/reddit/<run_id>/csv/predictions
+GET /api/finance/s1/reddit/<run_id>/csv/evaluation
+GET /api/finance/s1/reddit/<run_id>/csv/agent_changes
+GET /api/finance/s1/reddit/<run_id>/csv/round_metrics
+```
+
+`predictions` 接口默认返回 pre/post 两阶段结果，也可用 `?stage=pre` 或 `?stage=post` 过滤。
+
+已经完成图谱的场景可以通过前端“一键运行全部已构图场景”串行执行。后端读取 `Dataset/seed5_small_blind/zep_graphs_manifest.json`，只接受其中 `status=completed` 的条目；当前清单已通过 Zep Cloud 核验，包含 `SCN_001` 到 `SCN_018` 全部 18 个场景。单个场景失败会被记录，批次继续下一个场景，不会同时启动多套 OASIS 环境。批次目录中的 `scenario_summary.csv` 汇总每个场景的改判率、JS 变化、共识、群体熵、极化程度和互动量。对应 API 为：
+
+```text
+POST /api/finance/s1/reddit/batch/prepare
+POST /api/finance/s1/reddit/batch/run
+GET /api/finance/s1/reddit/batch/<batch_id>
+```
+
+每次 S1 运行归档在 `backend/uploads/finance/<run_id>/`，主要增加以下文件：
+
+- `history_memory.jsonl`：预载入每个投资者只读记忆的 5 条历史事件；
+- `current_event.json`：作为 Reddit 初始公开帖发布的当前事件及其图谱信息源；
+- `entity_agent_mapping.json`：图谱实体、动态 Agent ID、事件发布者和被提及实体之间的可审计映射；
+- `social_actions.jsonl`：从 OASIS `trace` 表导出的完整互动动作，包含推断轮次、Agent、动作类型和完整参数；
+- `interview_responses.json`：pre/post 两阶段采访的完整响应及重试；
+- `pre_social_predictions.jsonl`、`post_social_predictions.jsonl`：两阶段结构化预测；
+- `predictions.jsonl`：post-social 兼容副本；`predictions.csv` 同时包含两个阶段；
+- `prediction_changes.jsonl`、`agent_changes.csv`：逐 Agent 的改判、概率分布 JS、预期收益和置信度变化；
+- `social_metrics.json`：方向分布、平均概率、群体熵、共识率、极化程度、改判率和各项 pre/post 变化；
+- `round_metrics.csv`：逐轮动作数、活跃 Agent 数、发帖、评论、点赞、点踩和刷新数；
+- `evaluation.csv`：两阶段预测与隐藏五日真实结果的连接表。
+
+对应 OASIS 数据库位于 `backend/uploads/simulations/<simulation_id>/reddit_simulation.db`，其中 `trace` 表可用于统计真实发帖、评论、点赞、搜索和采访动作。
+
+S1 前端工作台地址：
+
+```text
+http://localhost:3000/finance/s1
+```
+
+页面支持选择单个匿名场景、复用或新建图谱、调整社会互动轮数、查看历史记忆与当前公开事件、启动后台互动、比较每个 Agent 的 pre/post 预测、查看群体指标与最近互动轨迹，以及一键串行运行图谱清单中的全部场景。页面不再提供“每轮分钟数”，因为 S1 轮次是离散互动步而非现实时间。
 
 根目录的 `npm run backend` 会优先使用 `backend/.venv`。因此在 Windows 上已有项目虚拟环境时，不要求额外安装 `uv`；如果两者都不存在，脚本才会回退到系统 Python。
 
@@ -166,4 +272,5 @@ GET /api/finance/c0/<run_id>/outcome
 
 ```text
 MiroFish/backend/.venv/Scripts/python.exe -m pytest -q MiroFish/backend/tests/test_finance_c0.py
+MiroFish/backend/.venv/Scripts/python.exe -m pytest -q MiroFish/backend/tests/test_finance_s1.py
 ```

@@ -255,41 +255,9 @@ class IPCHandler:
             interviews: [{"agent_id": int, "prompt": str}, ...]
         """
         try:
-            # 构建动作字典
-            actions = {}
-            agent_prompts = {}  # 记录每个agent的prompt
-            
-            for interview in interviews:
-                agent_id = interview.get("agent_id")
-                prompt = interview.get("prompt", "")
-                
-                try:
-                    agent = self.agent_graph.get_agent(agent_id)
-                    actions[agent] = ManualAction(
-                        action_type=ActionType.INTERVIEW,
-                        action_args={"prompt": prompt}
-                    )
-                    agent_prompts[agent_id] = prompt
-                except Exception as e:
-                    print(f"  警告: 无法获取Agent {agent_id}: {e}")
-            
-            if not actions:
-                self.send_response(command_id, "failed", error="没有有效的Agent")
-                return False
-            
-            # 执行批量Interview
-            await self.env.step(actions)
-            
-            # 获取所有结果
-            results = {}
-            for agent_id in agent_prompts.keys():
-                result = self._get_interview_result(agent_id)
-                results[agent_id] = result
-            
-            self.send_response(command_id, "completed", result={
-                "interviews_count": len(results),
-                "results": results
-            })
+            result = await self.execute_batch_interviews(interviews)
+            self.send_response(command_id, "completed", result=result)
+            results = result["results"]
             print(f"  批量Interview完成: {len(results)} 个Agent")
             return True
             
@@ -298,6 +266,31 @@ class IPCHandler:
             print(f"  批量Interview失败: {error_msg}")
             self.send_response(command_id, "failed", error=error_msg)
             return False
+
+    async def execute_batch_interviews(self, interviews: List[Dict]) -> Dict[str, Any]:
+        """Execute a batch inside the live environment without using IPC files."""
+        actions = {}
+        agent_ids = []
+        for interview in interviews:
+            agent_id = int(interview.get("agent_id"))
+            prompt = str(interview.get("prompt", ""))
+            try:
+                agent = self.agent_graph.get_agent(agent_id)
+                actions[agent] = ManualAction(
+                    action_type=ActionType.INTERVIEW,
+                    action_args={"prompt": prompt},
+                )
+                agent_ids.append(agent_id)
+            except Exception as error:
+                print(f"  警告: 无法获取Agent {agent_id}: {error}")
+        if not actions:
+            raise ValueError("没有有效的Agent")
+        await self.env.step(actions)
+        results = {
+            agent_id: self._get_interview_result(agent_id)
+            for agent_id in agent_ids
+        }
+        return {"interviews_count": len(results), "results": results}
     
     def _get_interview_result(self, agent_id: int) -> Dict[str, Any]:
         """从数据库获取最新的Interview结果"""
@@ -419,6 +412,15 @@ class RedditSimulationRunner:
         self.env = None
         self.agent_graph = None
         self.ipc_handler = None
+        self.finance_s1 = self.config.get("finance_s1") or {}
+        self._finance_action_count = 0
+        self._finance_action_log = os.path.join(
+            self.simulation_dir, "reddit", "actions.jsonl"
+        )
+        if self.finance_s1:
+            os.makedirs(os.path.dirname(self._finance_action_log), exist_ok=True)
+            with open(self._finance_action_log, "w", encoding="utf-8"):
+                pass
         
     def _load_config(self) -> Dict[str, Any]:
         """加载配置文件"""
@@ -432,7 +434,43 @@ class RedditSimulationRunner:
     def _get_db_path(self) -> str:
         """获取数据库路径"""
         return os.path.join(self.simulation_dir, "reddit_simulation.db")
-    
+
+    def _log_finance_record(self, record: Dict[str, Any]) -> None:
+        """Write the action/event contract consumed by SimulationRunner."""
+        if not self.finance_s1:
+            return
+        with open(self._finance_action_log, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _is_valid_finance_forecast_response(result: Dict[str, Any]) -> bool:
+        """Check enough of the JSON contract to retry before social turns."""
+        raw = result.get("response") if isinstance(result, dict) else None
+        text = raw.strip() if isinstance(raw, str) else ""
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S)
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", text, flags=re.S)
+            if not match:
+                return False
+            try:
+                payload = json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return False
+        if not isinstance(payload, dict):
+            return False
+        probabilities = payload.get("probabilities", payload)
+        return isinstance(probabilities, dict) and all(
+            probabilities.get(long_name, probabilities.get(short_name)) is not None
+            for long_name, short_name in (
+                ("up_probability", "up"),
+                ("neutral_probability", "neutral"),
+                ("down_probability", "down"),
+            )
+        )
+
     def _create_model(self):
         """
         创建LLM模型
@@ -501,6 +539,8 @@ class RedditSimulationRunner:
         
         candidates = []
         for cfg in agent_configs:
+            if self.finance_s1 and cfg.get("agent_class") != "investor":
+                continue
             agent_id = cfg.get("agent_id", 0)
             active_hours = cfg.get("active_hours", list(range(8, 23)))
             activity_level = cfg.get("activity_level", 0.5)
@@ -593,6 +633,16 @@ class RedditSimulationRunner:
         # 初始化IPC处理器
         self.ipc_handler = IPCHandler(self.simulation_dir, self.env, self.agent_graph)
         self.ipc_handler.update_status("running")
+
+        if self.finance_s1:
+            self._log_finance_record(
+                {
+                    "event_type": "simulation_start",
+                    "round": 0,
+                    "timestamp": datetime.now().isoformat(),
+                    "scenario_id": self.finance_s1.get("scenario_id"),
+                }
+            )
         
         # 执行初始事件
         event_config = self.config.get("event_config", {})
@@ -624,6 +674,95 @@ class RedditSimulationRunner:
             if initial_actions:
                 await self.env.step(initial_actions)
                 print(f"  已发布 {len(initial_actions)} 条初始帖子")
+                if self.finance_s1:
+                    for post in initial_posts:
+                        finance_event = post.get("finance_event") or {}
+                        self._log_finance_record(
+                            {
+                                "event_type": "current_event_published",
+                                "round": 0,
+                                "timestamp": datetime.now().isoformat(),
+                                "agent_id": post.get("poster_agent_id", 0),
+                                "event_id": finance_event.get("event_id"),
+                                "publisher_name": finance_event.get("publisher_name"),
+                            }
+                        )
+
+        # Finance S1 needs a true baseline from the same Agent instances. The
+        # private interview happens after the current event is public and
+        # before any investor gets an LLM social-action turn.
+        if self.finance_s1:
+            pre_interviews = self.finance_s1.get("pre_social_interviews") or []
+            if not pre_interviews:
+                raise ValueError("finance_s1.pre_social_interviews is required")
+            self._log_finance_record(
+                {
+                    "event_type": "pre_social_prediction_start",
+                    "round": 0,
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
+            pre_path = os.path.join(
+                self.simulation_dir, "pre_social_interviews.json"
+            )
+            try:
+                pre_result = await self.ipc_handler.execute_batch_interviews(
+                    pre_interviews
+                )
+                for result in pre_result.get("results", {}).values():
+                    if isinstance(result, dict):
+                        result["attempt_count"] = 1
+                attempts = [{"attempt": 1, "result": pre_result}]
+                invalid_ids = {
+                    int(agent_id)
+                    for agent_id, result in pre_result.get("results", {}).items()
+                    if not self._is_valid_finance_forecast_response(result)
+                }
+                if invalid_ids:
+                    retry_interviews = [
+                        {
+                            "agent_id": int(item["agent_id"]),
+                            "prompt": item.get("retry_prompt") or item["prompt"],
+                        }
+                        for item in pre_interviews
+                        if int(item["agent_id"]) in invalid_ids
+                    ]
+                    retry_result = await self.ipc_handler.execute_batch_interviews(
+                        retry_interviews
+                    )
+                    for result in retry_result.get("results", {}).values():
+                        if isinstance(result, dict):
+                            result["attempt_count"] = 2
+                    attempts.append({"attempt": 2, "result": retry_result})
+                    pre_result["results"].update(retry_result.get("results", {}))
+                pre_payload = {
+                    "success": True,
+                    "stage": "pre_social",
+                    "attempt_count": len(attempts),
+                    "attempts": attempts,
+                    **pre_result,
+                }
+            except Exception as error:
+                pre_payload = {
+                    "success": False,
+                    "stage": "pre_social",
+                    "attempt_count": 1,
+                    "error": str(error),
+                    "results": {},
+                }
+            with open(pre_path, "w", encoding="utf-8") as handle:
+                json.dump(pre_payload, handle, ensure_ascii=False, indent=2)
+            self._log_finance_record(
+                {
+                    "event_type": "pre_social_prediction_end",
+                    "round": 0,
+                    "timestamp": datetime.now().isoformat(),
+                    "success": pre_payload["success"],
+                    "prediction_count": len(pre_payload.get("results", {})),
+                }
+            )
+            if not pre_payload["success"]:
+                raise RuntimeError(pre_payload["error"])
         
         # 主模拟循环
         print("\n开始模拟循环...")
@@ -633,12 +772,31 @@ class RedditSimulationRunner:
             simulated_minutes = round_num * minutes_per_round
             simulated_hour = (simulated_minutes // 60) % 24
             simulated_day = simulated_minutes // (60 * 24) + 1
+
+            if self.finance_s1:
+                self._log_finance_record(
+                    {
+                        "event_type": "round_start",
+                        "round": round_num + 1,
+                        "simulated_hours": simulated_minutes / 60,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                )
             
             active_agents = self._get_active_agents_for_round(
                 self.env, simulated_hour, round_num
             )
             
             if not active_agents:
+                if self.finance_s1:
+                    self._log_finance_record(
+                        {
+                            "event_type": "round_end",
+                            "round": round_num + 1,
+                            "simulated_hours": simulated_minutes / 60,
+                            "timestamp": datetime.now().isoformat(),
+                        }
+                    )
                 continue
             
             actions = {
@@ -647,6 +805,30 @@ class RedditSimulationRunner:
             }
             
             await self.env.step(actions)
+
+            if self.finance_s1:
+                for agent_id, _agent in active_agents:
+                    self._finance_action_count += 1
+                    self._log_finance_record(
+                        {
+                            "round": round_num + 1,
+                            "timestamp": datetime.now().isoformat(),
+                            "platform": "reddit",
+                            "agent_id": agent_id,
+                            "agent_name": f"investor_{agent_id + 1:03d}",
+                            "action_type": "LLM_ACTION",
+                            "action_args": {},
+                            "success": True,
+                        }
+                    )
+                self._log_finance_record(
+                    {
+                        "event_type": "round_end",
+                        "round": round_num + 1,
+                        "simulated_hours": simulated_minutes / 60,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                )
             
             if (round_num + 1) % 10 == 0 or round_num == 0:
                 elapsed = (datetime.now() - start_time).total_seconds()
@@ -660,6 +842,17 @@ class RedditSimulationRunner:
         print(f"\n模拟循环完成!")
         print(f"  - 总耗时: {total_elapsed:.1f}秒")
         print(f"  - 数据库: {db_path}")
+
+        if self.finance_s1:
+            self._log_finance_record(
+                {
+                    "event_type": "simulation_end",
+                    "round": total_rounds,
+                    "total_rounds": total_rounds,
+                    "total_actions": self._finance_action_count,
+                    "timestamp": datetime.now().isoformat(),
+                }
+            )
         
         # 是否进入等待命令模式
         if self.wait_for_commands:

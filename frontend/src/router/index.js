@@ -6,6 +6,7 @@ import SimulationRunView from '../views/SimulationRunView.vue'
 import ReportView from '../views/ReportView.vue'
 import InteractionView from '../views/InteractionView.vue'
 import FinanceC0View from '../views/FinanceC0View.vue'
+import FinanceS1View from '../views/FinanceS1View.vue'
 
 const routes = [
   {
@@ -47,6 +48,11 @@ const routes = [
     path: '/finance/c0',
     name: 'FinanceC0',
     component: FinanceC0View
+  },
+  {
+    path: '/finance/s1',
+    name: 'FinanceS1',
+    component: FinanceS1View
   }
 ]
 

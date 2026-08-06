@@ -64,3 +64,8 @@ export function getProject(projectId) {
     method: 'get'
   })
 }
+
+/** 获取项目列表（S1 工作台用于选择已经完成图谱的项目） */
+export function listProjects(limit = 100) {
+  return service.get('/api/graph/project/list', { params: { limit } })
+}

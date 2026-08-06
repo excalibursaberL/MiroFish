@@ -1,8 +1,7 @@
 """Financial adaptation API.
 
-Only the C0 control group is exposed at this stage. Preparation is deliberately
-separate from execution so a researcher can inspect the frozen prompts and
-roles before any LLM call is made.
+C0 remains the independent control group.  S1 adds a Reddit-only OASIS social
+interaction prototype while keeping preparation separate from execution.
 """
 
 from __future__ import annotations
@@ -11,7 +10,12 @@ import traceback
 
 from flask import jsonify, request, send_file
 
-from ..finance import C0BackgroundRunner, C0ExperimentService
+from ..finance import (
+    C0BackgroundRunner,
+    C0ExperimentService,
+    S1BatchRunner,
+    S1ExperimentService,
+)
 from ..finance.dataset import DatasetValidationError
 from ..utils.logger import get_logger
 from . import finance_bp
@@ -22,6 +26,193 @@ logger = get_logger("mirofish.api.finance")
 
 def _service() -> C0ExperimentService:
     return C0ExperimentService()
+
+
+def _s1_service() -> S1ExperimentService:
+    return S1ExperimentService()
+
+
+@finance_bp.route("/s1/reddit/prepare", methods=["POST"])
+def prepare_s1_reddit():
+    """Freeze one anonymous Reddit S1 scenario without contacting the LLM."""
+    try:
+        data = request.get_json(silent=True) or {}
+        result = _s1_service().prepare(
+            run_id=data.get("run_id"),
+            dataset_path=data.get("dataset_path"),
+            scenario_id=data.get("scenario_id"),
+            graph_id=data.get("graph_id"),
+            project_id=data.get("project_id"),
+            source_mode=data.get("source_mode", "auto"),
+            social_rounds=data.get("social_rounds", S1ExperimentService.DEFAULT_SOCIAL_ROUNDS),
+        )
+        return jsonify({"success": True, "data": result})
+    except (DatasetValidationError, FileNotFoundError, ValueError) as error:
+        return jsonify({"success": False, "error": str(error)}), 400
+    except Exception as error:
+        logger.error("S1 Reddit preparation failed: %s", error)
+        return jsonify({"success": False, "error": str(error)}), 500
+
+
+@finance_bp.route("/s1/reddit/scenarios/<scenario_id>/seed", methods=["GET"])
+def get_s1_reddit_scenario_seed(scenario_id: str):
+    """Return only safe, pre-cutoff events for in-page graph construction."""
+    try:
+        return jsonify({
+            "success": True,
+            "data": _s1_service().get_scenario_seed_document(scenario_id),
+        })
+    except (DatasetValidationError, FileNotFoundError, ValueError) as error:
+        return jsonify({"success": False, "error": str(error)}), 404
+
+
+@finance_bp.route("/s1/reddit/batch/prepare", methods=["POST"])
+def prepare_s1_reddit_batch():
+    """Freeze all scenarios that have completed entries in the Zep manifest."""
+    try:
+        data = request.get_json(silent=True) or {}
+        result = S1BatchRunner().prepare(
+            social_rounds=data.get(
+                "social_rounds", S1ExperimentService.DEFAULT_SOCIAL_ROUNDS
+            ),
+            graph_manifest_path=data.get("graph_manifest_path"),
+        )
+        return jsonify({"success": True, "data": result})
+    except (DatasetValidationError, FileNotFoundError, ValueError) as error:
+        return jsonify({"success": False, "error": str(error)}), 400
+
+
+@finance_bp.route("/s1/reddit/batch/run", methods=["POST"])
+def run_s1_reddit_batch():
+    """Start a prepared all-graph batch in one serial background worker."""
+    try:
+        data = request.get_json(silent=True) or {}
+        batch_id = data.get("batch_id")
+        if not batch_id:
+            return jsonify({"success": False, "error": "batch_id is required"}), 400
+        result = S1BatchRunner().start(batch_id)
+        return jsonify({"success": True, "data": result}), 202
+    except (FileNotFoundError, ValueError) as error:
+        return jsonify({"success": False, "error": str(error)}), 400
+
+
+@finance_bp.route("/s1/reddit/batch/<batch_id>", methods=["GET"])
+def get_s1_reddit_batch_status(batch_id: str):
+    try:
+        return jsonify({
+            "success": True,
+            "data": S1BatchRunner().get_status(batch_id),
+        })
+    except (FileNotFoundError, ValueError) as error:
+        return jsonify({"success": False, "error": str(error)}), 404
+
+
+@finance_bp.route("/s1/reddit/batch/<batch_id>/csv", methods=["GET"])
+def download_s1_reddit_batch_summary(batch_id: str):
+    try:
+        path = S1BatchRunner().get_summary_path(batch_id)
+        return send_file(
+            path,
+            as_attachment=True,
+            download_name=f"{batch_id}_scenario_summary.csv",
+            mimetype="text/csv; charset=utf-8",
+        )
+    except (FileNotFoundError, ValueError) as error:
+        return jsonify({"success": False, "error": str(error)}), 404
+
+
+@finance_bp.route("/s1/reddit/run", methods=["POST"])
+def run_s1_reddit():
+    """Start one prepared S1 run in a background thread."""
+    try:
+        data = request.get_json(silent=True) or {}
+        run_id = data.get("run_id")
+        if not run_id:
+            return jsonify({"success": False, "error": "run_id is required"}), 400
+        result = _s1_service().run_background(run_id)
+        return jsonify({"success": True, "data": result}), 202
+    except (FileNotFoundError, ValueError, RuntimeError) as error:
+        return jsonify({"success": False, "error": str(error)}), 400
+
+
+@finance_bp.route("/s1/reddit/<run_id>", methods=["GET"])
+def get_s1_reddit_status(run_id: str):
+    try:
+        return jsonify({"success": True, "data": _s1_service().get_status(run_id)})
+    except (FileNotFoundError, ValueError) as error:
+        return jsonify({"success": False, "error": str(error)}), 404
+
+
+@finance_bp.route("/s1/reddit/<run_id>/settings", methods=["PATCH"])
+def update_s1_reddit_settings(run_id: str):
+    """Change interaction rounds after preparation, before running."""
+    try:
+        data = request.get_json(silent=True) or {}
+        result = _s1_service().update_settings(
+            run_id,
+            social_rounds=data.get("social_rounds"),
+        )
+        return jsonify({"success": True, "data": result})
+    except (FileNotFoundError, ValueError) as error:
+        return jsonify({"success": False, "error": str(error)}), 400
+
+
+@finance_bp.route("/s1/reddit/<run_id>/predictions", methods=["GET"])
+def get_s1_reddit_predictions(run_id: str):
+    try:
+        stage = request.args.get("stage", "all")
+        return jsonify({
+            "success": True,
+            "data": _s1_service().get_predictions(run_id, stage=stage),
+        })
+    except (FileNotFoundError, ValueError) as error:
+        return jsonify({"success": False, "error": str(error)}), 404
+
+
+@finance_bp.route("/s1/reddit/<run_id>/metrics", methods=["GET"])
+def get_s1_reddit_metrics(run_id: str):
+    try:
+        return jsonify({"success": True, "data": _s1_service().get_metrics(run_id)})
+    except (FileNotFoundError, ValueError) as error:
+        return jsonify({"success": False, "error": str(error)}), 404
+
+
+@finance_bp.route("/s1/reddit/<run_id>/actions", methods=["GET"])
+def get_s1_reddit_actions(run_id: str):
+    try:
+        raw_limit = request.args.get("limit")
+        limit = int(raw_limit) if raw_limit else None
+        return jsonify({
+            "success": True,
+            "data": _s1_service().get_actions(run_id, limit=limit),
+        })
+    except (FileNotFoundError, ValueError) as error:
+        return jsonify({"success": False, "error": str(error)}), 400
+
+
+@finance_bp.route("/s1/reddit/<run_id>/mapping", methods=["GET"])
+def get_s1_reddit_mapping(run_id: str):
+    """Return the frozen publisher/entity mapping without evaluation data."""
+    try:
+        return jsonify({"success": True, "data": _s1_service().get_mapping(run_id)})
+    except (FileNotFoundError, ValueError) as error:
+        return jsonify({"success": False, "error": str(error)}), 404
+
+
+@finance_bp.route("/s1/reddit/<run_id>/csv/<kind>", methods=["GET"])
+def download_s1_reddit_csv(run_id: str, kind: str):
+    try:
+        path = _s1_service().get_csv_path(run_id, kind)
+        return send_file(
+            path,
+            as_attachment=True,
+            download_name=f"{run_id}_{path.name}",
+            mimetype="text/csv; charset=utf-8",
+        )
+    except FileNotFoundError as error:
+        return jsonify({"success": False, "error": str(error)}), 404
+    except ValueError as error:
+        return jsonify({"success": False, "error": str(error)}), 400
 
 
 @finance_bp.route("/c0/scenarios", methods=["GET"])

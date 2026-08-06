@@ -378,6 +378,10 @@
               进入环境搭建
               <span class="btn-arrow">→</span>
             </button>
+            <button class="s1-step-btn" @click="router.push({ path: '/finance/s1', query: { projectId: currentProjectId } })">
+              使用当前图谱进行 S1 社会互动实验
+              <span class="btn-arrow">↗</span>
+            </button>
           </div>
         </div>
 
@@ -1985,6 +1989,26 @@ onUnmounted(() => {
 .next-step-btn:disabled {
   background: #ccc;
   cursor: not-allowed;
+}
+
+.s1-step-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 10px;
+  padding: 13px 16px;
+  color: #9a5a18;
+  background: #fff8ed;
+  border: 1px solid #d9a15d;
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.s1-step-btn:hover {
+  background: #fff0d8;
 }
 
 .btn-arrow {
