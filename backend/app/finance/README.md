@@ -264,6 +264,50 @@ http://localhost:3000/finance/s1
 
 页面支持选择单个匿名场景、复用或新建图谱、调整社会互动轮数、查看历史记忆与当前公开事件、启动后台互动、比较每个 Agent 的 pre/post 预测、查看群体指标与最近互动轨迹，以及一键串行运行图谱清单中的全部场景。页面不再提供“每轮分钟数”，因为 S1 轮次是离散互动步而非现实时间。
 
+## Research artifacts added
+
+- `round_belief_interviews.jsonl`: raw private forecast interviews after each social round.
+- `belief_snapshots.jsonl`: parsed round `0..N` belief rows for every investor; missing interviews are retained as `status=missing`.
+- `exposure_edges.jsonl`: one row per observed feed exposure or direct interaction, with viewer, content, author, round, first-seen round, and stance annotation provenance.
+- Source-account posts are labeled `informational`; investor posts/comments use explicit metadata when supplied by OASIS, otherwise `lexicon_v1` is a transparent heuristic and must not be treated as human ground truth.
+
+### Offline LLM stance annotation
+
+The social simulation does not call a second model to classify content. After
+an S1 run is complete, annotate the deduplicated posts/comments offline:
+
+```powershell
+cd MiroFish/backend
+python scripts/annotate_stances.py --run-id s1_reddit_xxxxxxxx
+```
+
+For a genuinely independent coder, set all three variables in `MiroFish/.env`:
+
+```dotenv
+STANCE_LLM_API_KEY=...
+STANCE_LLM_BASE_URL=https://api.example.com/v1
+STANCE_LLM_MODEL_NAME=an-independent-model
+```
+
+The API and the CLI require this independent configuration by default. The
+CLI's `--allow-primary-fallback` switch is for local debugging only and must
+not be used for the final experiment.
+
+The annotator writes `stance_annotations.jsonl` and `stance_annotations.csv`,
+plus the derived views `social_actions_annotated.jsonl` and
+`exposure_edges_annotated.jsonl`. Raw OASIS artifacts are never overwritten.
+The derived rows retain `baseline_content_stance`,
+`baseline_stance_score`, and `baseline_stance_source` so the former
+`lexicon_v1` result remains an auditable baseline. After annotation, the
+actions and exposure-edges API endpoints prefer the derived views; the
+dedicated endpoints are:
+
+```text
+POST /api/finance/s1/reddit/<run_id>/stance-annotate
+GET  /api/finance/s1/reddit/<run_id>/stance-annotations
+GET  /api/finance/s1/reddit/<run_id>/exposure-edges-annotated
+```
+
 根目录的 `npm run backend` 会优先使用 `backend/.venv`。因此在 Windows 上已有项目虚拟环境时，不要求额外安装 `uv`；如果两者都不存在，脚本才会回退到系统 Python。
 
 ## 静态验证

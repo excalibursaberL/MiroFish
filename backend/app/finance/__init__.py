@@ -11,6 +11,7 @@ from .evaluator import FinancialOutcomeEvaluator
 from .roles import C0_AGENT_COUNT, build_c0_profiles
 from .s1 import S1ExperimentService
 from .s1_batch import S1BatchRunner
+from .stance_annotator import OfflineStanceAnnotator, StanceAnnotationError
 
 __all__ = [
     "C0ExperimentService",
@@ -22,4 +23,6 @@ __all__ = [
     "build_c0_profiles",
     "S1ExperimentService",
     "S1BatchRunner",
+    "OfflineStanceAnnotator",
+    "StanceAnnotationError",
 ]

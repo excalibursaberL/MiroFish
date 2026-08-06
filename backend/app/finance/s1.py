@@ -8,6 +8,7 @@ event schedule, final forecast interview, and researcher-only artifacts.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import re
 import sqlite3
@@ -62,8 +63,24 @@ class S1ExperimentService:
     RUN_ID_PATTERN = re.compile(r"s1_reddit_[A-Za-z0-9_-]{6,64}")
     _background_lock = threading.Lock()
     _background_threads: Dict[str, threading.Thread] = {}
+    PROMPT_VERSION = "finance_forecast_s1_v2"
+    DEFAULT_AGENT_SET_VERSION = "n20_full"
+    DEFAULT_SAMPLING_METHOD = "full"
+    DEFAULT_DATA_SPLIT = "unspecified"
+    RUN_METADATA_FIELDS = (
+        "run_id",
+        "replicate_id",
+        "agent_set_version",
+        "sampling_method",
+        "data_split",
+        "input_snapshot_hash",
+        "prompt_version",
+        "prompt_hash",
+        "random_seed",
+    )
 
     CSV_FIELDS = (
+        *RUN_METADATA_FIELDS,
         "scenario_id",
         "condition",
         "prediction_stage",
@@ -83,6 +100,7 @@ class S1ExperimentService:
         "neutral_probability",
         "down_probability",
         "expected_return",
+        "expected_return_unit",
         "confidence",
         "evidence_event_ids",
         "reason",
@@ -111,6 +129,7 @@ class S1ExperimentService:
         "five_day_return_error",
     )
     AGENT_CHANGE_FIELDS = (
+        *RUN_METADATA_FIELDS,
         "scenario_id",
         "agent_id",
         "agent_role_label",
@@ -135,6 +154,7 @@ class S1ExperimentService:
         "pair_status",
     )
     ROUND_METRIC_FIELDS = (
+        *RUN_METADATA_FIELDS,
         "scenario_id",
         "round",
         "action_count",
@@ -145,6 +165,64 @@ class S1ExperimentService:
         "dislike_count",
         "refresh_count",
         "other_action_count",
+        "unique_post_id_count",
+        "unique_target_agent_count",
+        "exposure_count",
+    )
+    BELIEF_SNAPSHOT_FIELDS = (
+        *RUN_METADATA_FIELDS,
+        "scenario_id",
+        "round",
+        "snapshot_type",
+        "snapshot_source",
+        "agent_id",
+        "agent_role",
+        "agent_role_category",
+        "agent_role_label",
+        "agent_knowledge_level",
+        "agent_analysis_style",
+        "agent_risk_attitude",
+        "agent_investment_horizon",
+        "profile_version",
+        "as_of",
+        "horizon",
+        "direction",
+        "up_probability",
+        "neutral_probability",
+        "down_probability",
+        "expected_return",
+        "expected_return_unit",
+        "confidence",
+        "evidence_event_ids",
+        "reason",
+        "raw_response",
+        "status",
+        "error",
+        "attempt_count",
+        "finish_reason",
+        "response_content_length",
+        "reasoning_content_present",
+    )
+    EXPOSURE_FIELDS = (
+        *RUN_METADATA_FIELDS,
+        "scenario_id",
+        "exposure_id",
+        "trace_id",
+        "round",
+        "timestamp",
+        "viewer_agent_id",
+        "content_type",
+        "content_id",
+        "author_agent_id",
+        "content_text",
+        "content_stance",
+        "stance_score",
+        "stance_source",
+        "exposure_type",
+        "action_type",
+        "interacted",
+        "interaction_target_id",
+        "first_seen_round",
     )
 
     def __init__(
@@ -167,6 +245,26 @@ class S1ExperimentService:
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _sha256_json(value: Any) -> str:
+        payload = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    @classmethod
+    def _run_metadata(cls, manifest: Dict[str, Any]) -> Dict[str, Any]:
+        return {key: manifest.get(key) for key in cls.RUN_METADATA_FIELDS}
+
+    @classmethod
+    def _with_run_metadata(
+        cls, record: Dict[str, Any], manifest: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        enriched = dict(record)
+        enriched.update(cls._run_metadata(manifest))
+        enriched.setdefault("expected_return_unit", "decimal")
+        return enriched
 
     @staticmethod
     def _write_json(path: Path, value: Any) -> None:
@@ -220,13 +318,26 @@ class S1ExperimentService:
 
     @staticmethod
     def _load_graph_entities(graph_id: str) -> List[EntityNode]:
-        """Reuse MiroFish's Zep entity reader for the formal S1 source path."""
-        result = ZepEntityReader().filter_defined_entities(
-            graph_id=graph_id,
-            defined_entity_types=None,
-            enrich_with_edges=True,
-        )
-        return result.entities
+        """Load every named Zep node for publisher matching.
+
+        Some generated ontologies leave valid company nodes without a type
+        label. The generic entity reader filters those nodes, but S1 publisher
+        attribution depends on their names and must not silently discard them.
+        Only entities actually matched as event publishers become source
+        accounts, so retaining untyped nodes does not inflate active Agents.
+        """
+        nodes = ZepEntityReader().get_all_nodes(graph_id)
+        return [
+            EntityNode(
+                uuid=str(node.get("uuid", "")),
+                name=str(node.get("name", "")),
+                labels=list(node.get("labels") or []),
+                summary=str(node.get("summary", "")),
+                attributes=dict(node.get("attributes") or {}),
+            )
+            for node in nodes
+            if node.get("uuid") and str(node.get("name", "")).strip()
+        ]
 
     def _build_current_event(
         self,
@@ -281,6 +392,11 @@ class S1ExperimentService:
         project_id: Optional[str] = None,
         source_mode: str = "auto",
         social_rounds: int = DEFAULT_SOCIAL_ROUNDS,
+        replicate_id: Optional[str] = None,
+        data_split: str = DEFAULT_DATA_SPLIT,
+        agent_set_version: Optional[str] = None,
+        sampling_method: str = DEFAULT_SAMPLING_METHOD,
+        random_seed: Optional[int] = None,
     ) -> Dict[str, Any]:
         if isinstance(social_rounds, bool) or not isinstance(social_rounds, int):
             raise ValueError("social_rounds must be an integer")
@@ -313,6 +429,10 @@ class S1ExperimentService:
             raise ValueError("S1 prototype requires exactly one scenario with five seed events")
         scenario = scenarios[0]
         run_id = run_id or f"s1_reddit_{uuid.uuid4().hex[:12]}"
+        replicate_id = str(replicate_id or run_id)
+        data_split = str(data_split or self.DEFAULT_DATA_SPLIT)
+        agent_set_version = str(agent_set_version or self.DEFAULT_AGENT_SET_VERSION)
+        sampling_method = str(sampling_method or self.DEFAULT_SAMPLING_METHOD)
         run_dir = self._run_dir(run_id)
         if run_dir.exists() and any(run_dir.iterdir()):
             raise ValueError(f"S1 run already exists: {run_id}")
@@ -349,6 +469,7 @@ class S1ExperimentService:
         self._write_jsonl(run_dir / "scenarios.jsonl", [scenario.to_safe_dict()])
         self._write_jsonl(run_dir / "history_memory.jsonl", scenario.seed_events)
         self._write_json(run_dir / "current_event.json", current_event)
+        input_snapshot_hash = self._sha256_json(scenario.to_safe_dict())
         self._write_json(simulation_dir / "reddit_profiles.json", self._oasis_profiles(all_profiles))
 
         agent_configs = []
@@ -411,9 +532,63 @@ class S1ExperimentService:
                     }
                     for profile in investors
                 ],
+                "round_belief_snapshot_interviews": [
+                    {
+                        "agent_id": int(profile["user_id"]),
+                        "prompt": self.build_belief_snapshot_prompt(
+                            round_number="__ROUND_NUMBER__"
+                        ),
+                        "retry_prompt": (
+                            "The previous private belief snapshot was invalid. "
+                            "Return only the required JSON object.\n\n"
+                            + self.build_belief_snapshot_prompt(
+                                round_number="__ROUND_NUMBER__"
+                            )
+                        ),
+                    }
+                    for profile in investors
+                ],
+                "belief_snapshot_enabled": True,
                 "anonymous": True,
+                "prompt_version": self.PROMPT_VERSION,
             },
         }
+        prompt_hash = self._sha256_json(
+            {
+                "pre_social": [
+                    {
+                        "agent_id": int(profile["user_id"]),
+                        "prompt": self.build_forecast_prompt(
+                            scenario, stage="pre_social"
+                        ),
+                    }
+                    for profile in investors
+                ],
+                "post_social": [
+                    {
+                        "agent_id": int(profile["user_id"]),
+                        "prompt": self.build_forecast_prompt(
+                            scenario, stage="post_social"
+                        ),
+                    }
+                    for profile in investors
+                ],
+                "round_belief_snapshot": self.build_belief_snapshot_prompt(
+                    round_number="__ROUND_NUMBER__"
+                ),
+            }
+        )
+        config["finance_s1"].update(
+            {
+                "replicate_id": replicate_id,
+                "agent_set_version": agent_set_version,
+                "sampling_method": sampling_method,
+                "data_split": data_split,
+                "input_snapshot_hash": input_snapshot_hash,
+                "prompt_hash": prompt_hash,
+                "random_seed": random_seed,
+            }
+        )
         self._write_json(simulation_dir / "simulation_config.json", config)
         self._write_json(run_dir / "simulation_config.json", config)
 
@@ -438,6 +613,14 @@ class S1ExperimentService:
 
         manifest = {
             "run_id": run_id,
+            "replicate_id": replicate_id,
+            "agent_set_version": agent_set_version,
+            "sampling_method": sampling_method,
+            "data_split": data_split,
+            "input_snapshot_hash": input_snapshot_hash,
+            "prompt_version": self.PROMPT_VERSION,
+            "prompt_hash": prompt_hash,
+            "random_seed": random_seed,
             "group": self.GROUP,
             "platform": self.PLATFORM,
             "simulation_id": simulation_id,
@@ -462,10 +645,17 @@ class S1ExperimentService:
             "social_rounds": social_rounds,
             "total_rounds": total_rounds,
             "round_semantics": "interaction_step",
+            "belief_snapshot_enabled": True,
+            "expected_belief_snapshot_count": C0_AGENT_COUNT * (social_rounds + 1),
+            "stance_annotation": {
+                "status": "pending_offline_llm",
+                "prompt_version": "finance_stance_annotation_v1",
+            },
             "history_memory_event_count": len(scenario.seed_events),
             "current_public_event_count": 1,
             "prediction_target": {
                 "horizon": "next_5_trading_days",
+                "expected_return_unit": "decimal",
                 "neutral_threshold": FIVE_DAY_NEUTRAL_THRESHOLD,
                 "direction_definition": FIVE_DAY_DIRECTION_DEFINITION,
             },
@@ -484,7 +674,15 @@ class S1ExperimentService:
                 "history_memory": "history_memory.jsonl",
                 "current_event": "current_event.json",
                 "simulation_config": "simulation_config.json",
+                "round_belief_interviews": "round_belief_interviews.jsonl",
                 "social_actions": "social_actions.jsonl",
+                "agent_round_states": "agent_round_states.jsonl",
+                "belief_snapshots": "belief_snapshots.jsonl",
+                "exposure_edges": "exposure_edges.jsonl",
+                "stance_annotations": "stance_annotations.jsonl",
+                "stance_annotations_csv": "stance_annotations.csv",
+                "social_actions_annotated": "social_actions_annotated.jsonl",
+                "exposure_edges_annotated": "exposure_edges_annotated.jsonl",
                 "interview_responses": "interview_responses.json",
                 "predictions": "predictions.jsonl",
                 "pre_social_predictions": "pre_social_predictions.jsonl",
@@ -506,6 +704,7 @@ class S1ExperimentService:
         if stage not in {"pre_social", "post_social"}:
             raise ValueError("stage must be pre_social or post_social")
         stage_text = (
+            "expected_return must use decimal return units: 0.03 means +3%.\n"
             "这是社会互动开始前的第一次预测。当前事件已经公开，但你还没有看到其他投资者的观点。"
             "只能根据只读历史记忆、当前公开事件和自己的 Profile 判断。"
             if stage == "pre_social"
@@ -532,6 +731,21 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
             "不要点赞、发帖、评论、搜索或调用任何工具；只回答预测 JSON。\n\n"
             + self.build_forecast_prompt(scenario, stage=stage)
         )
+
+    @staticmethod
+    def build_belief_snapshot_prompt(*, round_number: int) -> str:
+        """Build a private, structured belief measurement prompt.
+
+        The prompt is intentionally independent of the social-action protocol.
+        It measures the Agent's current belief without asking it to publish,
+        like, or reply.  ``round_number`` is substituted when the live runner
+        executes the private interview.
+        """
+        return f"""Private belief measurement after interaction round {round_number}.
+Do not publish a post, write a comment, like, search, or call any tool.  Return exactly one JSON object.
+Use decimal return units: 0.03 means +3%.  Do not use future labels, actual prices, or information not visible in the current simulation.
+The probabilities must be numbers in [0, 1] and sum to 1.
+{{"direction":"up|neutral|down","up_probability":0.0,"neutral_probability":0.0,"down_probability":0.0,"expected_return":0.0,"confidence":0.0,"evidence_event_ids":[],"reason":"brief explanation"}}"""
 
     def run_sync(self, run_id: str, *, timeout: float = 900.0) -> Dict[str, Any]:
         run_dir = self._run_dir(run_id)
@@ -583,6 +797,12 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
             )
 
             self._export_social_actions(run_dir)
+            actions = self.get_actions(run_id)
+            exposure_edges = self._build_exposure_edges(run_dir, manifest, actions)
+            self._write_jsonl(
+                run_dir / "agent_round_states.jsonl",
+                self._build_agent_round_states(run_dir, manifest, actions),
+            )
             profiles = self._read_json(run_dir / "profiles.json")
             pre_predictions = self._parse_interviews(
                 scenario,
@@ -592,6 +812,10 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
                 stage="pre_social",
                 attempt_count=int(pre_response.get("attempt_count", 1)),
             )
+            pre_predictions = [
+                self._with_run_metadata(prediction, manifest)
+                for prediction in pre_predictions
+            ]
             interviews = [
                 {
                     "agent_id": int(p["user_id"]),
@@ -662,6 +886,27 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
                         retried_by_id.get(int(item["agent_id"]), item)
                         for item in post_predictions
                     ]
+            post_predictions = [
+                self._with_run_metadata(prediction, manifest)
+                for prediction in post_predictions
+            ]
+            raw_round_snapshot_path = simulation_dir / "round_belief_interviews.jsonl"
+            if raw_round_snapshot_path.exists():
+                # Keep a run-local copy so the manifest's artifact paths are
+                # self-contained and can be archived without the simulation
+                # manager directory.
+                (run_dir / "round_belief_interviews.jsonl").write_text(
+                    raw_round_snapshot_path.read_text(encoding="utf-8"),
+                    encoding="utf-8",
+                )
+            belief_snapshots = self._parse_round_belief_snapshots(
+                run_dir,
+                manifest,
+                scenario,
+                profiles,
+                pre_predictions,
+            )
+            self._write_jsonl(run_dir / "belief_snapshots.jsonl", belief_snapshots)
             self._write_json(
                 run_dir / "interview_responses.json",
                 {
@@ -675,6 +920,26 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
             )
             social_metrics, round_metrics = self._build_social_metrics(
                 run_dir, pre_predictions, post_predictions, changes
+            )
+            social_metrics["belief_snapshots"] = {
+                "expected_count": int(manifest.get("expected_belief_snapshot_count", 0)),
+                "record_count": len(belief_snapshots),
+                "valid_count": sum(item.get("status") == "ok" for item in belief_snapshots),
+                "round_counts": {
+                    str(round_number): sum(
+                        int(item.get("round", -1)) == round_number
+                        and item.get("status") == "ok"
+                        for item in belief_snapshots
+                    )
+                    for round_number in range(0, int(manifest.get("social_rounds", 0)) + 1)
+                },
+            }
+            social_metrics["social_behavior"]["exposure_edge_count"] = len(exposure_edges)
+            social_metrics["artifacts"].update(
+                {
+                    "belief_snapshots": "belief_snapshots.jsonl",
+                    "exposure_edges": "exposure_edges.jsonl",
+                }
             )
             self._write_jsonl(
                 run_dir / "pre_social_predictions.jsonl", pre_predictions
@@ -950,7 +1215,12 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
     def get_actions(
         self, run_id: str, *, limit: Optional[int] = None
     ) -> List[Dict[str, Any]]:
-        path = self._run_dir(run_id) / "social_actions.jsonl"
+        run_dir = self._run_dir(run_id)
+        # Once offline stance annotation has completed, expose the enriched
+        # view by default while keeping the raw OASIS export immutable on disk.
+        path = run_dir / "social_actions_annotated.jsonl"
+        if not path.exists():
+            path = run_dir / "social_actions.jsonl"
         if not path.exists():
             return []
         records = [
@@ -963,6 +1233,39 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
                 raise ValueError("limit must be a positive integer")
             return records[-limit:]
         return records
+
+    def get_agent_round_states(self, run_id: str) -> List[Dict[str, Any]]:
+        path = self._run_dir(run_id) / "agent_round_states.jsonl"
+        if not path.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def get_belief_snapshots(self, run_id: str) -> List[Dict[str, Any]]:
+        path = self._run_dir(run_id) / "belief_snapshots.jsonl"
+        if not path.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def get_exposure_edges(self, run_id: str) -> List[Dict[str, Any]]:
+        run_dir = self._run_dir(run_id)
+        path = run_dir / "exposure_edges_annotated.jsonl"
+        if not path.exists():
+            path = run_dir / "exposure_edges.jsonl"
+        if not path.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
 
     @staticmethod
     def _read_json(path: Path) -> Dict[str, Any]:
@@ -1018,6 +1321,363 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
         return records
 
     @staticmethod
+    def _classify_content_stance(
+        text: Any,
+        explicit: Any = None,
+    ) -> tuple[str, Optional[float], str]:
+        """Return a transparent, non-future-looking stance annotation.
+
+        OASIS normally stores only the content string for a post/comment.  We
+        preserve an explicit ``stance``/``sentiment`` value when one exists;
+        otherwise this small lexicon is a *heuristic annotation*, never a
+        replacement for a human or LLM content coder.  The source and score
+        are persisted so downstream analyses can filter or audit it.
+        """
+        if isinstance(explicit, str) and explicit.strip():
+            value = explicit.strip().lower()
+            aliases = {
+                "bullish": "positive",
+                "bearish": "negative",
+                "up": "positive",
+                "down": "negative",
+                "neutral": "neutral",
+                "mixed": "mixed",
+                "positive": "positive",
+                "negative": "negative",
+            }
+            normalized = aliases.get(value)
+            if normalized:
+                return normalized, None, "explicit_action_metadata"
+        if not isinstance(text, str) or not text.strip():
+            return "unknown", None, "unlabeled"
+        positive_terms = (
+            "利好", "积极", "乐观", "看好", "上行", "上涨", "增长", "放量",
+            "落地", "改善", "突破", "正面", "good news", "bullish", "upside",
+        )
+        negative_terms = (
+            "利空", "悲观", "风险", "亏损", "扩大", "回调", "下行", "下跌",
+            "担忧", "不确定", "谨慎", "竞争激烈", "negative", "bearish", "downside",
+        )
+        lowered = text.lower()
+        positive_count = sum(lowered.count(term.lower()) for term in positive_terms)
+        negative_count = sum(lowered.count(term.lower()) for term in negative_terms)
+        total = positive_count + negative_count
+        if total == 0:
+            return "unknown", None, "unlabeled"
+        score = (positive_count - negative_count) / total
+        if positive_count and negative_count:
+            label = "mixed" if abs(score) < 0.6 else (
+                "positive" if score > 0 else "negative"
+            )
+        elif positive_count:
+            label = "positive"
+        else:
+            label = "negative"
+        return label, round(score, 6), "lexicon_v1"
+
+    @staticmethod
+    def _snapshot_record_from_forecast(
+        forecast: Dict[str, Any],
+        manifest: Dict[str, Any],
+        *,
+        round_number: int,
+        snapshot_type: str,
+        snapshot_source: str,
+    ) -> Dict[str, Any]:
+        record = {
+            **S1ExperimentService._run_metadata(manifest),
+            **forecast,
+            "scenario_id": forecast.get("scenario_id") or manifest.get("scenario_id"),
+            "round": round_number,
+            "snapshot_type": snapshot_type,
+            "snapshot_source": snapshot_source,
+        }
+        # ``condition``/``prediction_stage`` are useful when loading this JSONL
+        # beside predictions.csv, but are deliberately not part of the compact
+        # snapshot CSV field list.
+        record["condition"] = "S1_ROUND_SNAPSHOT"
+        record["prediction_stage"] = f"round_{round_number}"
+        return record
+
+    def _parse_round_belief_snapshots(
+        self,
+        run_dir: Path,
+        manifest: Dict[str, Any],
+        scenario: FinancialScenario,
+        profiles: Sequence[Dict[str, Any]],
+        pre_predictions: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Parse round-0 and private post-round interviews into one JSONL.
+
+        A row is emitted for every investor and every expected round, including
+        an explicit ``status=missing`` row when a live snapshot was unavailable.
+        This makes missingness measurable instead of silently shrinking the
+        sample used by information-flow analysis.
+        """
+        rows: List[Dict[str, Any]] = []
+        pre_by_id = {int(item["agent_id"]): item for item in pre_predictions}
+        for profile in profiles:
+            agent_id = int(profile["user_id"])
+            forecast = pre_by_id.get(agent_id)
+            if forecast is None:
+                forecast = {
+                    "scenario_id": manifest.get("scenario_id"),
+                    "agent_id": agent_id,
+                    "agent_role": profile.get("role_id", "investor"),
+                    "agent_role_category": profile.get("role_category", ""),
+                    "agent_role_label": profile.get("role_label", ""),
+                    "as_of": scenario.prediction_cutoff,
+                    "horizon": scenario.horizon,
+                    "status": "missing",
+                    "error": "pre-social prediction is missing",
+                    "evidence_event_ids": [],
+                }
+            rows.append(
+                self._snapshot_record_from_forecast(
+                    forecast,
+                    manifest,
+                    round_number=0,
+                    snapshot_type="pre_social",
+                    snapshot_source="pre_social_interview",
+                )
+            )
+
+        raw_path = (
+            Path(SimulationManager.SIMULATION_DATA_DIR)
+            / manifest["simulation_id"]
+            / "round_belief_interviews.jsonl"
+        )
+        payloads: Dict[int, Dict[str, Any]] = {}
+        if raw_path.exists():
+            for line in raw_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    payload = json.loads(line)
+                    payloads[int(payload["round"])] = payload
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    logger.warning("Ignoring malformed belief snapshot payload: %s", line[:200])
+
+        parser = C0ExperimentService()
+        for round_number in range(1, int(manifest.get("social_rounds", 0)) + 1):
+            payload = payloads.get(round_number, {})
+            results = payload.get("results") or {}
+            attempt_count = int(payload.get("attempt_count", 1) or 1)
+            for profile in profiles:
+                agent_id = int(profile["user_id"])
+                item = results.get(str(agent_id), results.get(agent_id, {}))
+                raw = item.get("response", "") if isinstance(item, dict) else item
+                raw = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+                if raw.strip():
+                    forecast = parser.parse_forecast(
+                        scenario=scenario,
+                        profile=profile,
+                        raw_response=raw,
+                        attempt_count=(
+                            int(item.get("attempt_count", attempt_count))
+                            if isinstance(item, dict) else attempt_count
+                        ),
+                        finish_reason="stop",
+                    ).to_dict()
+                else:
+                    forecast = {
+                        "scenario_id": scenario.scenario_id,
+                        "agent_id": agent_id,
+                        "agent_role": profile.get("role_id", "investor"),
+                        "agent_role_category": profile.get("role_category", ""),
+                        "agent_role_label": profile.get("role_label", ""),
+                        "as_of": scenario.prediction_cutoff,
+                        "horizon": scenario.horizon,
+                        "status": "missing",
+                        "error": payload.get("error") or "round belief snapshot is missing",
+                        "attempt_count": attempt_count,
+                        "evidence_event_ids": [],
+                        "raw_response": raw,
+                    }
+                rows.append(
+                    self._snapshot_record_from_forecast(
+                        forecast,
+                        manifest,
+                        round_number=round_number,
+                        snapshot_type="post_round",
+                        snapshot_source="private_round_interview",
+                    )
+                )
+        return rows
+
+    def _build_exposure_edges(
+        self,
+        run_dir: Path,
+        manifest: Dict[str, Any],
+        actions: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Normalize feed visibility and direct interactions into edge rows."""
+        post_owners: Dict[Any, int] = {}
+        comment_owners: Dict[Any, int] = {}
+        content: Dict[tuple[str, Any], Dict[str, Any]] = {}
+        for action in actions:
+            agent_id = action.get("agent_id")
+            action_type = str(action.get("action_type", "")).lower()
+            args = action.get("action_args") or {}
+            if action_type == "create_post" and action.get("post_id") is not None:
+                post_id = action.get("post_id")
+                post_owners[post_id] = int(agent_id)
+                text = args.get("content", "")
+                if action.get("agent_class") == "source":
+                    label, score, source = "informational", 0.0, "source_event"
+                else:
+                    label, score, source = self._classify_content_stance(
+                        text, args.get("stance", args.get("sentiment"))
+                    )
+                content[("post", post_id)] = {
+                    "author_agent_id": int(agent_id),
+                    "content_text": text,
+                    "content_stance": label,
+                    "stance_score": score,
+                    "stance_source": source,
+                }
+            elif action_type == "create_comment" and action.get("comment_id") is not None:
+                comment_id = action.get("comment_id")
+                comment_owners[comment_id] = int(agent_id)
+                text = args.get("content", "")
+                label, score, source = self._classify_content_stance(
+                    text, args.get("stance", args.get("sentiment"))
+                )
+                content[("comment", comment_id)] = {
+                    "author_agent_id": int(agent_id),
+                    "content_text": text,
+                    "content_stance": label,
+                    "stance_score": score,
+                    "stance_source": source,
+                }
+
+        # Refresh/trend payloads contain the comments visible inside each
+        # post.  Preserve those content objects even when the trace has no
+        # standalone ``create_comment`` relation for them.
+        for action in actions:
+            visible_posts = (action.get("action_args") or {}).get("posts")
+            if not isinstance(visible_posts, list):
+                continue
+            for post in visible_posts:
+                if not isinstance(post, dict):
+                    continue
+                for comment in post.get("comments") or []:
+                    if not isinstance(comment, dict) or comment.get("comment_id") is None:
+                        continue
+                    comment_id = comment.get("comment_id")
+                    if ("comment", comment_id) in content:
+                        continue
+                    author_id = comment.get("user_id", comment.get("author_id"))
+                    text = comment.get("content", "")
+                    if author_id is not None and int(author_id) >= self.SOURCE_AGENT_START:
+                        label, score, source = "informational", 0.0, "source_event"
+                    else:
+                        label, score, source = self._classify_content_stance(text)
+                    content[("comment", comment_id)] = {
+                        "author_agent_id": int(author_id) if author_id is not None else None,
+                        "content_text": text,
+                        "content_stance": label,
+                        "stance_score": score,
+                        "stance_source": source,
+                    }
+
+        edges: List[Dict[str, Any]] = []
+        first_seen: Dict[tuple[int, str, Any], int] = {}
+
+        def add_edge(
+            action: Dict[str, Any],
+            content_type: str,
+            content_id: Any,
+            exposure_type: str,
+            interacted: bool,
+        ) -> None:
+            if content_id is None or action.get("agent_class") != "investor":
+                return
+            key = (int(action["agent_id"]), content_type, content_id)
+            round_number = int(action.get("round", 0) or 0)
+            first_seen[key] = min(round_number, first_seen.get(key, round_number))
+            metadata = content.get((content_type, content_id), {})
+            interaction_target = (
+                action.get("target_post_id")
+                if content_type == "post" else action.get("target_comment_id")
+            )
+            trace_id = action.get("trace_id")
+            exposure_id = f"{trace_id}:{content_type}:{content_id}"
+            edges.append(
+                {
+                    **self._run_metadata(manifest),
+                    "scenario_id": manifest.get("scenario_id"),
+                    "exposure_id": exposure_id,
+                    "trace_id": trace_id,
+                    "round": round_number,
+                    "timestamp": action.get("timestamp"),
+                    "viewer_agent_id": int(action["agent_id"]),
+                    "content_type": content_type,
+                    "content_id": content_id,
+                    "author_agent_id": metadata.get("author_agent_id"),
+                    "content_text": metadata.get("content_text", ""),
+                    "content_stance": metadata.get("content_stance", "unknown"),
+                    "stance_score": metadata.get("stance_score"),
+                    "stance_source": metadata.get("stance_source", "unlabeled"),
+                    "exposure_type": exposure_type,
+                    "action_type": action.get("action_type"),
+                    "interacted": bool(interacted),
+                    "interaction_target_id": interaction_target,
+                    "first_seen_round": round_number,
+                }
+            )
+
+        for action in actions:
+            if action.get("agent_class") != "investor":
+                continue
+            visible_ids = action.get("visible_post_ids") or []
+            for post_id in visible_ids:
+                add_edge(action, "post", post_id, "feed_visible", False)
+            visible_posts = (action.get("action_args") or {}).get("posts")
+            if isinstance(visible_posts, list):
+                for post in visible_posts:
+                    if not isinstance(post, dict):
+                        continue
+                    for comment in post.get("comments") or []:
+                        if isinstance(comment, dict):
+                            add_edge(
+                                action,
+                                "comment",
+                                comment.get("comment_id"),
+                                "feed_visible",
+                                False,
+                            )
+            action_type = str(action.get("action_type", "")).lower()
+            if action_type in {"like_post", "dislike_post", "create_comment"}:
+                add_edge(
+                    action,
+                    "post",
+                    action.get("target_post_id"),
+                    "direct_action",
+                    True,
+                )
+            if action_type in {"like_comment", "dislike_comment"}:
+                add_edge(
+                    action,
+                    "comment",
+                    action.get("target_comment_id"),
+                    "direct_action",
+                    True,
+                )
+
+        for edge in edges:
+            edge["first_seen_round"] = first_seen.get(
+                (
+                    int(edge["viewer_agent_id"]),
+                    str(edge["content_type"]),
+                    edge["content_id"],
+                ),
+                edge["round"],
+            )
+        self._write_jsonl(run_dir / "exposure_edges.jsonl", edges)
+        return edges
+
+    @staticmethod
     def _social_counts(run_dir: Path) -> Dict[int, Dict[str, int]]:
         path = run_dir / "social_actions.jsonl"
         if not path.exists():
@@ -1046,6 +1706,78 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
                 item["dislike"] += 1
         return counts
 
+    def _build_agent_round_states(
+        self,
+        run_dir: Path,
+        manifest: Dict[str, Any],
+        actions: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Aggregate observed exposure/actions per investor and interaction round.
+
+        This artifact intentionally contains no fabricated per-round beliefs. It
+        records only what the OASIS trace makes observable, which can be joined
+        with the actual pre/post forecasts for information-flow analysis.
+        """
+        profiles_path = run_dir / "profiles.json"
+        profiles = self._read_json(profiles_path) if profiles_path.exists() else []
+        investor_ids = [int(profile["user_id"]) for profile in profiles]
+        rows: List[Dict[str, Any]] = []
+        for round_number in range(1, int(manifest.get("social_rounds", 0)) + 1):
+            for agent_id in investor_ids:
+                records = [
+                    item
+                    for item in actions
+                    if int(item.get("agent_id", -1)) == agent_id
+                    and int(item.get("round", 0)) == round_number
+                ]
+                action_types = [
+                    str(item.get("action_type", "")).lower() for item in records
+                ]
+                visible_post_ids = {
+                    post_id
+                    for item in records
+                    for post_id in (item.get("visible_post_ids") or [])
+                    if post_id is not None
+                }
+                visible_agent_ids = {
+                    target_id
+                    for item in records
+                    for target_id in (item.get("visible_agent_ids") or [])
+                    if target_id is not None
+                }
+                target_agent_ids = {
+                    target_id
+                    for item in records
+                    for target_id in [item.get("target_agent_id")]
+                    if target_id is not None
+                }
+                rows.append(
+                    {
+                        **self._run_metadata(manifest),
+                        "scenario_id": manifest.get("scenario_id"),
+                        "round": round_number,
+                        "agent_id": agent_id,
+                        "action_count": len(records),
+                        "post_count": action_types.count("create_post"),
+                        "comment_count": action_types.count("create_comment"),
+                        "like_count": sum(
+                            action in {"like_post", "like_comment"}
+                            for action in action_types
+                        ),
+                        "dislike_count": sum(
+                            action in {"dislike_post", "dislike_comment"}
+                            for action in action_types
+                        ),
+                        "refresh_count": action_types.count("refresh"),
+                        "visible_post_ids": sorted(visible_post_ids, key=str),
+                        "visible_agent_ids": sorted(visible_agent_ids, key=str),
+                        "target_agent_ids": sorted(target_agent_ids, key=str),
+                        "exposure_count": len(visible_post_ids),
+                        "state_source": "oasis_trace_actions",
+                    }
+                )
+        return rows
+
     def _export_social_actions(self, run_dir: Path) -> List[Dict[str, Any]]:
         """Export the authoritative OASIS trace with an inferred social round."""
         manifest = self._read_json(run_dir / "manifest.json")
@@ -1058,6 +1790,7 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
             return []
 
         intervals: List[tuple[int, datetime, datetime]] = []
+        trace_ranges: List[tuple[int, int, int]] = []
         round_starts: Dict[int, datetime] = {}
         action_log = simulation_dir / "reddit" / "actions.jsonl"
         if action_log.exists():
@@ -1074,14 +1807,26 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
                     round_starts[round_number] = stamp
                 elif round_number in round_starts:
                     intervals.append((round_number, round_starts[round_number], stamp))
+                if event_type == "round_end":
+                    trace_start = record.get("trace_start_rowid")
+                    trace_end = record.get("trace_end_rowid")
+                    if isinstance(trace_start, int) and isinstance(trace_end, int):
+                        trace_ranges.append(
+                            (round_number, trace_start, trace_end)
+                        )
 
-        def infer_round(stamp: datetime, agent_id: int) -> int:
+        def infer_round(
+            stamp: datetime, agent_id: int, trace_id: int
+        ) -> tuple[int, str]:
+            for round_number, start_rowid, end_rowid in trace_ranges:
+                if start_rowid < trace_id <= end_rowid:
+                    return round_number, "oasis_trace_rowid_range"
             if agent_id >= self.SOURCE_AGENT_START:
-                return 0
+                return 0, "source_initialization"
             for round_number, start, end in intervals:
                 if start <= stamp <= end:
-                    return round_number
-            return 0
+                    return round_number, "oasis_trace_time_window"
+            return 0, "unattributed"
 
         records = []
         with sqlite3.connect(db_path) as connection:
@@ -1099,22 +1844,120 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
             except json.JSONDecodeError:
                 action_args = {"raw_info": info}
             stamp = datetime.fromisoformat(str(created_at))
-            records.append(
-                {
-                    "trace_id": int(trace_id),
-                    "scenario_id": manifest["scenario_id"],
-                    "round": infer_round(stamp, int(agent_id)),
-                    "timestamp": str(created_at),
-                    "platform": "reddit",
-                    "agent_id": int(agent_id),
-                    "agent_class": (
-                        "investor"
-                        if int(agent_id) < self.SOURCE_AGENT_START else "source"
-                    ),
-                    "action_type": str(action),
-                    "action_args": action_args,
-                }
+            round_number, round_source = infer_round(
+                stamp, int(agent_id), int(trace_id)
             )
+            def optional_arg(*keys: str) -> Any:
+                for key in keys:
+                    value = action_args.get(key)
+                    if value is not None and value != "":
+                        return value
+                return None
+
+            action_type = str(action).lower()
+            post_id = optional_arg("post_id", "target_post_id")
+            comment_id = optional_arg("comment_id", "target_comment_id")
+            target_post_id = optional_arg("target_post_id")
+            target_comment_id = optional_arg("target_comment_id")
+            if action_type not in {"create_post"} and target_post_id is None:
+                target_post_id = post_id
+            if action_type not in {"create_comment"} and target_comment_id is None:
+                target_comment_id = comment_id
+            if action_type == "create_comment" and target_comment_id is None:
+                target_comment_id = optional_arg("parent_comment_id", "parent_id")
+            visible_posts = action_args.get("posts")
+            if not isinstance(visible_posts, list):
+                visible_posts = []
+            visible_post_ids = [
+                item.get("post_id")
+                for item in visible_posts
+                if isinstance(item, dict) and item.get("post_id") is not None
+            ]
+            visible_agent_ids = [
+                item.get("user_id")
+                for item in visible_posts
+                if isinstance(item, dict) and item.get("user_id") is not None
+            ]
+
+            record = {
+                "trace_id": int(trace_id),
+                **self._run_metadata(manifest),
+                "scenario_id": manifest["scenario_id"],
+                "round": round_number,
+                "round_source": round_source,
+                "timestamp": str(created_at),
+                "platform": "reddit",
+                "agent_id": int(agent_id),
+                "agent_class": (
+                    "investor"
+                    if int(agent_id) < self.SOURCE_AGENT_START else "source"
+                ),
+                "action_type": action_type,
+                "action_args": action_args,
+                # These are populated only when OASIS explicitly records them;
+                # an absent relation remains null instead of being inferred.
+                "source_agent_id": optional_arg("source_agent_id", "author_id"),
+                "target_agent_id": optional_arg("target_agent_id", "target_user_id", "parent_author_id"),
+                "post_id": post_id,
+                "comment_id": comment_id,
+                "parent_comment_id": optional_arg("parent_comment_id", "parent_id"),
+                "target_post_id": target_post_id,
+                "target_comment_id": target_comment_id,
+                "visibility": optional_arg("visibility"),
+                "stance": optional_arg("stance", "sentiment", "direction"),
+                "supports": optional_arg("supports"),
+                "challenges": optional_arg("challenges"),
+                "adopts": optional_arg("adopts"),
+                "evidence_event_ids": optional_arg("evidence_event_ids", "event_ids"),
+                "content_stance": None,
+                "stance_score": None,
+                "stance_source": "unlabeled",
+                "visible_post_ids": visible_post_ids,
+                "visible_agent_ids": visible_agent_ids,
+                "exposure_count": len(visible_post_ids),
+            }
+            records.append(record)
+        post_owners = {
+            item["post_id"]: item["agent_id"]
+            for item in records
+            if item.get("action_type") == "create_post"
+            and item.get("post_id") is not None
+        }
+        comment_owners = {
+            item["comment_id"]: item["agent_id"]
+            for item in records
+            if item.get("action_type") == "create_comment"
+            and item.get("comment_id") is not None
+        }
+        for item in records:
+            if item.get("target_agent_id") is not None:
+                continue
+            if item.get("target_comment_id") in comment_owners:
+                item["target_agent_id"] = comment_owners[item["target_comment_id"]]
+            elif item.get("target_post_id") in post_owners:
+                item["target_agent_id"] = post_owners[item["target_post_id"]]
+        for item in records:
+            action_type = str(item.get("action_type", "")).lower()
+            if action_type not in {"create_post", "create_comment"}:
+                if action_type in {"like_post", "like_comment"}:
+                    item["interaction_stance"] = "supports_target"
+                elif action_type in {"dislike_post", "dislike_comment"}:
+                    item["interaction_stance"] = "challenges_target"
+                else:
+                    item["interaction_stance"] = None
+                continue
+            args = item.get("action_args") or {}
+            if item.get("agent_class") == "source":
+                label, score, source = "informational", 0.0, "source_event"
+            else:
+                label, score, source = self._classify_content_stance(
+                    args.get("content", ""),
+                    args.get("stance", args.get("sentiment", args.get("direction"))),
+                )
+            item["content_stance"] = label
+            item["stance_score"] = score
+            item["stance_source"] = source
+            item["interaction_stance"] = "author_position"
         self._write_jsonl(run_dir / "social_actions.jsonl", records)
         return records
 
@@ -1171,8 +2014,13 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
             paired_ok = before.get("status") == "ok" and after.get("status") == "ok"
             before_evidence = list(before.get("evidence_event_ids") or [])
             after_evidence = list(after.get("evidence_event_ids") or [])
+            metadata_source = after if after else before
             changes.append(
                 {
+                    **{
+                        key: metadata_source.get(key)
+                        for key in self.RUN_METADATA_FIELDS
+                    },
                     "scenario_id": before.get("scenario_id") or after.get("scenario_id"),
                     "agent_id": agent_id,
                     "agent_role_label": before.get("agent_role_label") or after.get("agent_role_label"),
@@ -1301,8 +2149,19 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
             dislike_count = sum(action in {"dislike_post", "dislike_comment"} for action in action_types)
             refresh_count = action_types.count("refresh")
             classified = post_count + comment_count + like_count + dislike_count + refresh_count
+            post_ids = {
+                item.get("post_id")
+                for item in records
+                if item.get("post_id") is not None
+            }
+            target_agent_ids = {
+                item.get("target_agent_id")
+                for item in records
+                if item.get("target_agent_id") is not None
+            }
             round_metrics.append(
                 {
+                    **self._run_metadata(manifest),
                     "scenario_id": manifest["scenario_id"],
                     "round": round_number,
                     "action_count": len(records),
@@ -1313,6 +2172,11 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
                     "dislike_count": dislike_count,
                     "refresh_count": refresh_count,
                     "other_action_count": len(records) - classified,
+                    "unique_post_id_count": len(post_ids),
+                    "unique_target_agent_count": len(target_agent_ids),
+                    "exposure_count": sum(
+                        int(item.get("exposure_count", 0) or 0) for item in records
+                    ),
                 }
             )
 
@@ -1324,6 +2188,7 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
         pre_metrics = self._prediction_stage_metrics(pre_predictions)
         post_metrics = self._prediction_stage_metrics(post_predictions)
         metrics = {
+            **self._run_metadata(manifest),
             "scenario_id": manifest["scenario_id"],
             "generated_at": self._now(),
             "flow": [
@@ -1331,6 +2196,7 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
                 "current_event",
                 "pre_social_prediction",
                 "social_interaction",
+                "round_belief_snapshots",
                 "post_social_prediction",
             ],
             "social_rounds": manifest["social_rounds"],
@@ -1380,10 +2246,19 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
                 "active_investor_count": len({
                     item["agent_id"] for item in investor_actions
                 }),
+                "exposure_count": sum(
+                    int(item.get("exposure_count", 0) or 0)
+                    for item in investor_actions
+                ),
+                "observed_target_relation_count": sum(
+                    item.get("target_agent_id") is not None
+                    for item in investor_actions
+                ),
                 "action_type_counts": action_type_counts,
             },
             "artifacts": {
                 "complete_trace": "social_actions.jsonl",
+                "agent_round_states": "agent_round_states.jsonl",
                 "round_metrics": "round_metrics.csv",
                 "agent_changes": "agent_changes.csv",
             },

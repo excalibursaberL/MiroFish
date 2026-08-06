@@ -29,6 +29,11 @@ class S1BatchRunner:
     _lock = threading.Lock()
     _threads: Dict[str, threading.Thread] = {}
     SUMMARY_FIELDS = (
+        "replicate_id",
+        "agent_set_version",
+        "sampling_method",
+        "data_split",
+        "random_seed",
         "scenario_id",
         "run_id",
         "status",
@@ -43,6 +48,8 @@ class S1BatchRunner:
         "pre_polarization",
         "post_polarization",
         "investor_action_count",
+        "belief_snapshot_valid_rate",
+        "exposure_edge_count",
         "error",
     )
 
@@ -76,6 +83,11 @@ class S1BatchRunner:
         *,
         social_rounds: int = S1ExperimentService.DEFAULT_SOCIAL_ROUNDS,
         graph_manifest_path: Optional[str | Path] = None,
+        data_split: str = S1ExperimentService.DEFAULT_DATA_SPLIT,
+        replicate_id: Optional[str] = None,
+        agent_set_version: Optional[str] = None,
+        sampling_method: str = S1ExperimentService.DEFAULT_SAMPLING_METHOD,
+        random_seed: Optional[int] = None,
     ) -> Dict[str, Any]:
         if isinstance(social_rounds, bool) or not isinstance(social_rounds, int):
             raise ValueError("social_rounds must be an integer")
@@ -116,6 +128,15 @@ class S1BatchRunner:
             "run_mode": "all_prebuilt_graphs",
             "graph_manifest_path": str(graph_manifest),
             "social_rounds": social_rounds,
+            "data_split": str(data_split or S1ExperimentService.DEFAULT_DATA_SPLIT),
+            "replicate_id": replicate_id,
+            "agent_set_version": str(
+                agent_set_version or S1ExperimentService.DEFAULT_AGENT_SET_VERSION
+            ),
+            "sampling_method": str(
+                sampling_method or S1ExperimentService.DEFAULT_SAMPLING_METHOD
+            ),
+            "random_seed": random_seed,
             "scenario_count": len(completed),
             "completed_scenario_count": 0,
             "failed_scenario_count": 0,
@@ -148,8 +169,21 @@ class S1BatchRunner:
             pre = metrics.get("pre_social") or {}
             post = metrics.get("post_social") or {}
             behavior = metrics.get("social_behavior") or {}
+            snapshots = metrics.get("belief_snapshots") or {}
+            expected_snapshots = int(snapshots.get("expected_count", 0) or 0)
             records.append(
                 {
+                    "replicate_id": (metrics.get("replicate_id") or manifest.get("replicate_id")),
+                    "agent_set_version": (
+                        metrics.get("agent_set_version")
+                        or manifest.get("agent_set_version")
+                    ),
+                    "sampling_method": (
+                        metrics.get("sampling_method")
+                        or manifest.get("sampling_method")
+                    ),
+                    "data_split": metrics.get("data_split") or manifest.get("data_split"),
+                    "random_seed": metrics.get("random_seed", manifest.get("random_seed")),
                     "scenario_id": item.get("scenario_id"),
                     "run_id": item.get("run_id"),
                     "status": item.get("status"),
@@ -168,12 +202,33 @@ class S1BatchRunner:
                     "pre_polarization": pre.get("mean_pairwise_js_divergence"),
                     "post_polarization": post.get("mean_pairwise_js_divergence"),
                     "investor_action_count": behavior.get("investor_action_count"),
+                    "belief_snapshot_valid_rate": (
+                        float(snapshots.get("valid_count", 0) or 0) / expected_snapshots
+                        if expected_snapshots else None
+                    ),
+                    "exposure_edge_count": behavior.get("exposure_edge_count"),
                     "error": item.get("error"),
                 }
             )
         S1ExperimentService._write_csv(
             batch_dir / "scenario_summary.csv", records, self.SUMMARY_FIELDS
         )
+
+    def _try_write_summary(
+        self, batch_dir: Path, manifest: Dict[str, Any]
+    ) -> bool:
+        """Keep the batch alive when Windows temporarily locks the summary."""
+        try:
+            self._write_summary(batch_dir, manifest)
+            manifest.pop("summary_write_error", None)
+            return True
+        except PermissionError as error:
+            manifest["summary_write_error"] = str(error)
+            logger.warning(
+                "S1 batch summary is locked; scenario execution will continue: %s",
+                batch_dir / "scenario_summary.csv",
+            )
+            return False
 
     @classmethod
     def is_active(cls, batch_id: str) -> bool:
@@ -221,6 +276,13 @@ class S1BatchRunner:
                         graph_id=item["graph_id"],
                         source_mode="graph",
                         social_rounds=int(manifest["social_rounds"]),
+                        data_split=manifest.get("data_split", "unspecified"),
+                        replicate_id=(
+                            f"{manifest.get('replicate_id') or batch_id}:{scenario_id}"
+                        ),
+                        agent_set_version=manifest.get("agent_set_version"),
+                        sampling_method=manifest.get("sampling_method", "full"),
+                        random_seed=manifest.get("random_seed"),
                     )
                     item.update(
                         {"status": "running", "run_id": run_manifest["run_id"]}
@@ -244,7 +306,7 @@ class S1BatchRunner:
                 )
                 manifest["updated_at"] = self._now()
                 self._write_json(path, manifest)
-                self._write_summary(path.parent, manifest)
+                self._try_write_summary(path.parent, manifest)
             manifest["current_scenario_id"] = None
             manifest["status"] = (
                 "completed"
@@ -252,7 +314,8 @@ class S1BatchRunner:
             )
             manifest["updated_at"] = self._now()
             self._write_json(path, manifest)
-            self._write_summary(path.parent, manifest)
+            self._try_write_summary(path.parent, manifest)
+            self._write_json(path, manifest)
         finally:
             with self._lock:
                 current = self._threads.get(batch_id)

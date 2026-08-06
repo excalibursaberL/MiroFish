@@ -70,6 +70,19 @@ def test_default_blind_dataset_has_five_seeds():
     assert scenario.prediction_cutoff == "T+0d"
 
 
+def test_expected_return_is_normalized_to_decimal_units():
+    assert C0ExperimentService._expected_return(3.5) == pytest.approx(0.035)
+    assert C0ExperimentService._expected_return(-2.5) == pytest.approx(-0.025)
+    assert C0ExperimentService._expected_return(0.03) == pytest.approx(0.03)
+    assert C0ExperimentService._expected_return("3.5%") == pytest.approx(0.035)
+    assert C0ExperimentService._expected_return(
+        0.5, direction="neutral"
+    ) == pytest.approx(0.005)
+    assert C0ExperimentService._expected_return(
+        0.5, direction="up"
+    ) == pytest.approx(0.5)
+
+
 def test_original_or_nested_evaluator_fields_are_rejected(tmp_path):
     path = tmp_path / "unsafe.jsonl"
     payload = {
@@ -149,8 +162,14 @@ def test_prepare_and_dry_run_do_not_call_llm(tmp_path):
     assert manifest["scenario_count"] == 1
     assert manifest["expected_prediction_count"] == 20
     assert manifest["prediction_target"]["neutral_threshold"] == pytest.approx(0.017)
+    assert manifest["prediction_target"]["expected_return_unit"] == "decimal"
     assert "-1.7%" in manifest["prediction_target"]["direction_definition"]
     assert manifest["files"]["llm_responses"] == "llm_responses.jsonl"
+    assert manifest["replicate_id"] == manifest["run_id"]
+    assert manifest["agent_set_version"] == "n20_full"
+    assert manifest["sampling_method"] == "full"
+    assert len(manifest["input_snapshot_hash"]) == 64
+    assert len(manifest["prompt_hash"]) == 64
     run_id = manifest["run_id"]
     prompt_lines = (tmp_path / run_id / "prompts.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(prompt_lines) == 20
@@ -263,6 +282,9 @@ def test_all_mode_writes_prediction_and_evaluation_csv_without_network(
     assert len(evaluation_rows) == 360
     assert "agent_analysis_style" in prediction_rows[0]
     assert "agent_risk_attitude" in prediction_rows[0]
+    assert prediction_rows[0]["run_id"] == run_id
+    assert prediction_rows[0]["expected_return_unit"] == "decimal"
+    assert float(prediction_rows[0]["expected_return"]) == pytest.approx(0.03)
     assert Counter(row["scenario_id"] for row in prediction_rows) == {
         f"SCN_{index:03d}": 20 for index in range(1, 19)
     }

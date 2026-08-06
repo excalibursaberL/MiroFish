@@ -40,7 +40,10 @@ class FinanceEventSourceResolver:
     """
 
     _MEDIA_PREFIX = re.compile(
-        r"^\s*(?P<name>财经媒体[A-Za-z0-9_]+?)(?:T[+-]\d+d)?(?:电|讯)"
+        # Keep the date-bearing anonymous outlet ID intact.  ``BT-53d`` and
+        # ``BT+0d`` are distinct publisher identities in the frozen seed;
+        # using a lazy group here previously truncated both to ``财经媒体B``.
+        r"^\s*(?P<name>财经媒体[A-Za-z0-9_]+(?:[+-]\d+d)?)(?:电|讯)"
     )
     _LEADING_ANONYMOUS_COMPANY = re.compile(
         r"^\s*\*?(?:[一二两三四五六七八九十0-9]+连板)?(?P<name>COMPANY_\d+)"
@@ -94,17 +97,49 @@ class FinanceEventSourceResolver:
                 text, scenario.name
             )
             graph_match, graph_match_method = self._match_graph_entity(inferred_name)
+            if (
+                graph_match is None
+                and inferred_name
+                and self._is_target_company_alias(
+                    text=text,
+                    inferred_name=inferred_name,
+                    scenario_company=scenario.name,
+                )
+            ):
+                scenario_match, _ = self._match_graph_entity(scenario.name)
+                if scenario_match is not None:
+                    graph_match = scenario_match
+                    graph_match_method = "graph_scenario_company_alias"
 
             if graph_match is not None:
                 source = self._source_from_graph(graph_match)
                 resolution_method = f"{inference_method}+{graph_match_method}"
             elif inferred_name:
                 if source_mode == "graph":
-                    unmatched_graph_publishers.append(
-                        f"{event.get('event_id')}={inferred_name}"
-                    )
-                source = self._source_from_text(inferred_name)
-                resolution_method = inference_method
+                    if self.graph_entities:
+                        # A graph can legitimately omit a publisher that is
+                        # explicit in the frozen seed (for example the
+                        # current-event outlet). Preserve that identity as a
+                        # text-derived source instead of assigning it to an
+                        # unrelated graph node. The resolution is marked for
+                        # audit and the source has no Zep UUID.
+                        source = self._source_from_text(inferred_name)
+                        resolution_method = (
+                            f"{inference_method}+"
+                            "graph_missing_publisher_text_fallback"
+                        )
+                    else:
+                        # An empty graph is still a hard error in graph mode;
+                        # otherwise a failed graph load would silently turn
+                        # the experiment into a scenario-only run.
+                        unmatched_graph_publishers.append(
+                            f"{event.get('event_id')}={inferred_name}"
+                        )
+                        source = self._source_from_text(inferred_name)
+                        resolution_method = inference_method
+                else:
+                    source = self._source_from_text(inferred_name)
+                    resolution_method = inference_method
             else:
                 source = self._public_feed_source()
                 resolution_method = "public_feed_fallback"
@@ -162,6 +197,27 @@ class FinanceEventSourceResolver:
             "events": event_records,
         }
         return source_profiles, event_records, mapping
+
+    @classmethod
+    def _is_target_company_alias(
+        cls, *, text: str, inferred_name: str, scenario_company: str
+    ) -> bool:
+        """Recognize an unblinded issuer prefix as the anonymous target.
+
+        This handles legacy blind snapshots where a few historical events
+        retained the issuer's old short name while the graph and scenario use
+        ``COMPANY_NNN``. The mapping remains explicit in
+        ``publisher_resolution`` and is limited to issuer-disclosure prefixes.
+        """
+        company = cls._normalize_name(scenario_company)
+        publisher = cls._normalize_name(inferred_name)
+        if not company.startswith("COMPANY_") or not publisher:
+            return False
+        stripped = str(text or "").lstrip().lstrip("*").strip()
+        return any(
+            stripped.startswith(f"{publisher}{marker}")
+            for marker in ("公告", "披露", "发布", "回复")
+        )
 
     @classmethod
     def _view(cls, entity: EntityNode) -> GraphEntityView:
@@ -238,6 +294,20 @@ class FinanceEventSourceResolver:
                     for alias in entity.aliases
                 ):
                     return entity, "graph_alias"
+        # A few blind graph snapshots changed a media/exchange display name
+        # but retained a unique ontology label. Use that label only when it
+        # identifies exactly one candidate, keeping the mapping auditable and
+        # avoiding arbitrary publisher assignment.
+        inferred_type = self._classify_source_type(inferred_name or "", ())
+        if inferred_type in {"media", "exchange", "regulator", "company"}:
+            candidates = [
+                entity
+                for entity in self.graph_entities
+                if self._classify_source_type(entity.name, entity.labels)
+                == inferred_type
+            ]
+            if len(candidates) == 1:
+                return candidates[0], "graph_unique_type"
         return None, "graph_unmatched"
 
     def _mentioned_entity_ids(self, text: str) -> List[str]:
@@ -356,5 +426,4 @@ class FinanceEventSourceResolver:
     @staticmethod
     def _normalize_name(value: str) -> str:
         normalized = str(value or "").strip().lstrip("*").strip()
-        normalized = re.sub(r"T[+-]\d+d$", "", normalized)
         return normalized.strip(" ，,:：。；;（）()[]【】")

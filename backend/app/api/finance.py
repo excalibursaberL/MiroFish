@@ -13,6 +13,7 @@ from flask import jsonify, request, send_file
 from ..finance import (
     C0BackgroundRunner,
     C0ExperimentService,
+    OfflineStanceAnnotator,
     S1BatchRunner,
     S1ExperimentService,
 )
@@ -45,6 +46,13 @@ def prepare_s1_reddit():
             project_id=data.get("project_id"),
             source_mode=data.get("source_mode", "auto"),
             social_rounds=data.get("social_rounds", S1ExperimentService.DEFAULT_SOCIAL_ROUNDS),
+            replicate_id=data.get("replicate_id"),
+            data_split=data.get("data_split", S1ExperimentService.DEFAULT_DATA_SPLIT),
+            agent_set_version=data.get("agent_set_version"),
+            sampling_method=data.get(
+                "sampling_method", S1ExperimentService.DEFAULT_SAMPLING_METHOD
+            ),
+            random_seed=data.get("random_seed"),
         )
         return jsonify({"success": True, "data": result})
     except (DatasetValidationError, FileNotFoundError, ValueError) as error:
@@ -76,6 +84,13 @@ def prepare_s1_reddit_batch():
                 "social_rounds", S1ExperimentService.DEFAULT_SOCIAL_ROUNDS
             ),
             graph_manifest_path=data.get("graph_manifest_path"),
+            data_split=data.get("data_split", S1ExperimentService.DEFAULT_DATA_SPLIT),
+            replicate_id=data.get("replicate_id"),
+            agent_set_version=data.get("agent_set_version"),
+            sampling_method=data.get(
+                "sampling_method", S1ExperimentService.DEFAULT_SAMPLING_METHOD
+            ),
+            random_seed=data.get("random_seed"),
         )
         return jsonify({"success": True, "data": result})
     except (DatasetValidationError, FileNotFoundError, ValueError) as error:
@@ -190,6 +205,81 @@ def get_s1_reddit_actions(run_id: str):
         return jsonify({"success": False, "error": str(error)}), 400
 
 
+@finance_bp.route("/s1/reddit/<run_id>/agent-round-states", methods=["GET"])
+def get_s1_reddit_agent_round_states(run_id: str):
+    """Return observed per-agent/per-round exposure and action aggregates."""
+    try:
+        return jsonify({
+            "success": True,
+            "data": _s1_service().get_agent_round_states(run_id),
+        })
+    except (FileNotFoundError, ValueError) as error:
+        return jsonify({"success": False, "error": str(error)}), 404
+
+
+@finance_bp.route("/s1/reddit/<run_id>/belief-snapshots", methods=["GET"])
+def get_s1_reddit_belief_snapshots(run_id: str):
+    """Return private round-level belief measurements."""
+    try:
+        return jsonify({
+            "success": True,
+            "data": _s1_service().get_belief_snapshots(run_id),
+        })
+    except (FileNotFoundError, ValueError) as error:
+        return jsonify({"success": False, "error": str(error)}), 404
+
+
+@finance_bp.route("/s1/reddit/<run_id>/exposure-edges", methods=["GET"])
+def get_s1_reddit_exposure_edges(run_id: str):
+    """Return one row per observed viewer/content exposure or interaction."""
+    try:
+        return jsonify({
+            "success": True,
+            "data": _s1_service().get_exposure_edges(run_id),
+        })
+    except (FileNotFoundError, ValueError) as error:
+        return jsonify({"success": False, "error": str(error)}), 404
+
+
+@finance_bp.route("/s1/reddit/<run_id>/stance-annotate", methods=["POST"])
+def annotate_s1_reddit_stances(run_id: str):
+    """Annotate saved posts/comments after an S1 run using an independent LLM."""
+    try:
+        data = request.get_json(silent=True) or {}
+        force = data.get("force", False)
+        if not isinstance(force, bool):
+            return jsonify({"success": False, "error": "force must be a boolean"}), 400
+        result = OfflineStanceAnnotator().annotate_run(run_id, force=force)
+        return jsonify({"success": True, "data": result})
+    except (FileNotFoundError, ValueError, RuntimeError) as error:
+        return jsonify({"success": False, "error": str(error)}), 400
+    except Exception as error:
+        logger.error("S1 stance annotation failed: %s", error)
+        return jsonify({"success": False, "error": str(error)}), 500
+
+
+@finance_bp.route("/s1/reddit/<run_id>/stance-annotations", methods=["GET"])
+def get_s1_reddit_stance_annotations(run_id: str):
+    try:
+        return jsonify({
+            "success": True,
+            "data": OfflineStanceAnnotator().get_annotations(run_id),
+        })
+    except (FileNotFoundError, ValueError) as error:
+        return jsonify({"success": False, "error": str(error)}), 404
+
+
+@finance_bp.route("/s1/reddit/<run_id>/exposure-edges-annotated", methods=["GET"])
+def get_s1_reddit_annotated_exposure_edges(run_id: str):
+    try:
+        return jsonify({
+            "success": True,
+            "data": OfflineStanceAnnotator().get_annotated_exposure_edges(run_id),
+        })
+    except (FileNotFoundError, ValueError) as error:
+        return jsonify({"success": False, "error": str(error)}), 404
+
+
 @finance_bp.route("/s1/reddit/<run_id>/mapping", methods=["GET"])
 def get_s1_reddit_mapping(run_id: str):
     """Return the frozen publisher/entity mapping without evaluation data."""
@@ -262,6 +352,13 @@ def prepare_c0():
             scenario_ids=scenario_ids,
             limit=limit,
             run_mode=run_mode,
+            replicate_id=data.get("replicate_id"),
+            data_split=data.get("data_split", C0ExperimentService.DEFAULT_DATA_SPLIT),
+            agent_set_version=data.get("agent_set_version"),
+            sampling_method=data.get(
+                "sampling_method", C0ExperimentService.DEFAULT_SAMPLING_METHOD
+            ),
+            random_seed=data.get("random_seed"),
         )
         return jsonify({"success": True, "data": result})
     except (DatasetValidationError, FileNotFoundError, ValueError) as error:

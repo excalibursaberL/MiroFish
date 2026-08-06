@@ -27,6 +27,7 @@ class C0Forecast:
     neutral_probability: Optional[float] = None
     down_probability: Optional[float] = None
     expected_return: Optional[float] = None
+    expected_return_unit: str = "decimal"
     confidence: Optional[float] = None
     evidence_event_ids: List[str] = field(default_factory=list)
     reason: str = ""
@@ -58,6 +59,7 @@ class C0Forecast:
             "neutral_probability": self.neutral_probability,
             "down_probability": self.down_probability,
             "expected_return": self.expected_return,
+            "expected_return_unit": self.expected_return_unit,
             "confidence": self.confidence,
             "evidence_event_ids": self.evidence_event_ids,
             "reason": self.reason,

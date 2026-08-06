@@ -10,6 +10,7 @@ later.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import re
@@ -68,7 +69,23 @@ class C0ExperimentService:
     ATOMIC_REPLACE_ATTEMPTS = 8
     ATOMIC_REPLACE_INITIAL_DELAY = 0.05
     ATOMIC_REPLACE_MAX_DELAY = 0.4
+    PROMPT_VERSION = "finance_forecast_c0_v2"
+    DEFAULT_AGENT_SET_VERSION = "n20_full"
+    DEFAULT_SAMPLING_METHOD = "full"
+    DEFAULT_DATA_SPLIT = "unspecified"
+    RUN_METADATA_FIELDS = (
+        "run_id",
+        "replicate_id",
+        "agent_set_version",
+        "sampling_method",
+        "data_split",
+        "input_snapshot_hash",
+        "prompt_version",
+        "prompt_hash",
+        "random_seed",
+    )
     PREDICTION_CSV_FIELDS = (
+        *RUN_METADATA_FIELDS,
         "scenario_id",
         "agent_id",
         "agent_role",
@@ -86,6 +103,7 @@ class C0ExperimentService:
         "neutral_probability",
         "down_probability",
         "expected_return",
+        "expected_return_unit",
         "confidence",
         "evidence_event_ids",
         "reason",
@@ -136,6 +154,11 @@ class C0ExperimentService:
         scenario_ids: Optional[Sequence[str]] = None,
         limit: Optional[int] = None,
         run_mode: str = "single",
+        replicate_id: Optional[str] = None,
+        data_split: str = DEFAULT_DATA_SPLIT,
+        agent_set_version: Optional[str] = None,
+        sampling_method: str = DEFAULT_SAMPLING_METHOD,
+        random_seed: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Freeze scenarios, roles, and prompts without calling the LLM."""
         if run_mode not in self.RUN_MODES:
@@ -165,6 +188,10 @@ class C0ExperimentService:
                 f"found counts: {', '.join(map(str, invalid_seed_counts))}"
             )
         run_id = run_id or f"c0_{uuid.uuid4().hex[:12]}"
+        replicate_id = str(replicate_id or run_id)
+        data_split = str(data_split or self.DEFAULT_DATA_SPLIT)
+        agent_set_version = str(agent_set_version or self.DEFAULT_AGENT_SET_VERSION)
+        sampling_method = str(sampling_method or self.DEFAULT_SAMPLING_METHOD)
         run_dir = self._run_dir(run_id)
         if run_dir.exists() and any(run_dir.iterdir()):
             raise ValueError(f"C0 run already exists: {run_id}")
@@ -179,6 +206,7 @@ class C0ExperimentService:
             run_dir / "scenarios.jsonl",
             (scenario.to_safe_dict() for scenario in scenarios),
         )
+        input_snapshot_hash = self._sha256_file(run_dir / "scenarios.jsonl")
 
         prompt_records = []
         for scenario in scenarios:
@@ -193,16 +221,49 @@ class C0ExperimentService:
                         "user": user_prompt,
                     }
                 )
+        prompt_hash = self._sha256_json(
+            [
+                {
+                    "scenario_id": item["scenario_id"],
+                    "agent_id": item["agent_id"],
+                    "system": item["system"],
+                    "user": item["user"],
+                }
+                for item in prompt_records
+            ]
+        )
+        prompt_metadata = {
+            "run_id": run_id,
+            "replicate_id": replicate_id,
+            "agent_set_version": agent_set_version,
+            "sampling_method": sampling_method,
+            "data_split": data_split,
+            "input_snapshot_hash": input_snapshot_hash,
+            "prompt_version": self.PROMPT_VERSION,
+            "prompt_hash": prompt_hash,
+            "random_seed": random_seed,
+        }
+        for record in prompt_records:
+            record.update(prompt_metadata)
         self._write_jsonl(run_dir / "prompts.jsonl", prompt_records)
 
         manifest = {
             "run_id": run_id,
+            "replicate_id": replicate_id,
+            "agent_set_version": agent_set_version,
+            "sampling_method": sampling_method,
+            "data_split": data_split,
+            "input_snapshot_hash": input_snapshot_hash,
+            "prompt_version": self.PROMPT_VERSION,
+            "prompt_hash": prompt_hash,
+            "random_seed": random_seed,
             "group": self.GROUP,
             "run_mode": run_mode,
             "social_interaction": False,
             "prediction_target": {
                 "horizon": "next_5_trading_days",
                 "return_definition": "R5 = close5 / original_price - 1",
+                "expected_return_unit": "decimal",
                 "neutral_threshold": FIVE_DAY_NEUTRAL_THRESHOLD,
                 "direction_definition": FIVE_DAY_DIRECTION_DEFINITION,
             },
@@ -376,7 +437,12 @@ READ={current.get('read', '')} MARKET={current.get('market', '')}
         response_trace_path = run_dir / "llm_responses.jsonl"
         can_resume = manifest.get("run_mode") == "all" and prediction_path.exists()
         predictions: List[Dict[str, Any]] = (
-            self._read_jsonl(prediction_path) if can_resume else []
+            [
+                self._with_run_metadata(record, manifest)
+                for record in self._read_jsonl(prediction_path)
+            ]
+            if can_resume
+            else []
         )
         expected_keys = {
             (scenario.scenario_id, int(profile["user_id"]))
@@ -448,7 +514,7 @@ READ={current.get('read', '')} MARKET={current.get('market', '')}
                     user_prompt=user_prompt,
                     response_trace_path=response_trace_path,
                 )
-                record = forecast.to_dict()
+                record = self._with_run_metadata(forecast.to_dict(), manifest)
                 predictions.append(record)
                 completed_key_set.add(prediction_key)
                 self._append_prediction_artifact(run_dir, record, predictions)
@@ -770,7 +836,9 @@ READ={current.get('read', '')} MARKET={current.get('market', '')}
                 up_probability=up,
                 neutral_probability=neutral,
                 down_probability=down,
-                expected_return=self._number(payload.get("expected_return")),
+                expected_return=self._expected_return(
+                    payload.get("expected_return"), direction=direction
+                ),
                 confidence=self._probability(payload.get("confidence")),
                 evidence_event_ids=evidence,
                 reason=str(payload.get("reason", "")),
@@ -960,6 +1028,72 @@ READ={current.get('read', '')} MARKET={current.get('market', '')}
         if not math.isfinite(number):
             raise ValueError("number must be finite")
         return number
+
+    @staticmethod
+    def _expected_return(
+        value: Any, *, direction: Optional[str] = None
+    ) -> Optional[float]:
+        """Parse a return as a decimal, accepting legacy percentage outputs.
+
+        The experiment stores returns in decimal form (``0.03`` means +3%).
+        Older prompts/models sometimes return ``3.5`` or ``"3.5%"`` for +3.5%,
+        so values outside [-1, 1] are interpreted as percentage points. A
+        neutral forecast also uses its fixed return band to disambiguate values
+        such as ``0.5`` (0.5%, not 50%).
+        """
+        if value is None or value == "":
+            return None
+        if isinstance(value, str):
+            text = value.strip()
+            has_percent_sign = text.endswith("%")
+            if has_percent_sign:
+                text = text[:-1].strip()
+            number = float(text)
+        else:
+            has_percent_sign = False
+            number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("expected_return must be finite")
+        if has_percent_sign or abs(number) > 1:
+            number /= 100.0
+        elif (
+            direction == "neutral"
+            and abs(number) > FIVE_DAY_NEUTRAL_THRESHOLD
+            and abs(number / 100.0) <= FIVE_DAY_NEUTRAL_THRESHOLD
+        ):
+            number /= 100.0
+        return number
+
+    @staticmethod
+    def _sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _sha256_json(value: Any) -> str:
+        payload = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _run_metadata(manifest: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            key: manifest.get(key)
+            for key in C0ExperimentService.RUN_METADATA_FIELDS
+        }
+
+    @classmethod
+    def _with_run_metadata(
+        cls, record: Dict[str, Any], manifest: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        enriched = dict(record)
+        enriched.update(cls._run_metadata(manifest))
+        enriched.setdefault("expected_return_unit", "decimal")
+        return enriched
 
     @staticmethod
     def _role_counts(profiles: Iterable[Dict[str, Any]]) -> Dict[str, int]:

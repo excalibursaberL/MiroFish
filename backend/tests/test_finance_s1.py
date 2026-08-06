@@ -7,6 +7,7 @@ import pytest
 from app.finance.s1 import S1ExperimentService
 from app.finance.s1_batch import S1BatchRunner
 from app.finance.source_resolver import FinanceEventSourceResolver
+from app.finance.dataset import FinancialScenario
 from app.services.simulation_manager import SimulationManager
 from app.services.zep_entity_reader import EntityNode
 
@@ -36,6 +37,13 @@ def test_s1_reddit_prepare_uses_scenario_attributed_publishers_and_safe_events(
     assert manifest["history_memory_event_count"] == 5
     assert manifest["current_public_event_count"] == 1
     assert manifest["expected_prediction_count"] == 40
+    assert manifest["replicate_id"] == manifest["run_id"]
+    assert manifest["agent_set_version"] == "n20_full"
+    assert manifest["sampling_method"] == "full"
+    assert len(manifest["input_snapshot_hash"]) == 64
+    assert len(manifest["prompt_hash"]) == 64
+    assert manifest["files"]["agent_round_states"] == "agent_round_states.jsonl"
+    assert manifest["prediction_target"]["expected_return_unit"] == "decimal"
 
     run_dir = tmp_path / "finance" / manifest["run_id"]
     investors = json.loads((run_dir / "profiles.json").read_text(encoding="utf-8"))
@@ -158,7 +166,10 @@ def test_s1_graph_mode_reuses_zep_entities_for_dynamic_source_profiles(
     assert {profile["source_origin"] for profile in sources} == {"zep_graph"}
     current = json.loads((run_dir / "current_event.json").read_text(encoding="utf-8"))
     assert current["publisher_agent_id"] in {20, 21}
-    assert "+graph_exact" in current["publisher_resolution"]
+    # Date-bearing media identifiers are preserved during parsing.  The
+    # fixture intentionally uses a generic media alias, so the resolver uses
+    # its auditable substring match instead of pretending it was an exact ID.
+    assert "+graph_alias" in current["publisher_resolution"]
 
 
 def test_s1_graph_mode_requires_graph_id(tmp_path):
@@ -244,6 +255,209 @@ def test_s1_graph_mode_rejects_publishers_missing_from_graph(monkeypatch, tmp_pa
             graph_id="mirofish_empty_graph",
             source_mode="graph",
         )
+
+
+def test_s1_graph_loader_keeps_named_nodes_without_ontology_labels(monkeypatch):
+    class FakeReader:
+        def get_all_nodes(self, _graph_id):
+            return [
+                {
+                    "uuid": "untyped-company",
+                    "name": "COMPANY_006",
+                    "labels": [],
+                    "summary": "anonymous listed company",
+                    "attributes": {},
+                }
+            ]
+
+    monkeypatch.setattr("app.finance.s1.ZepEntityReader", lambda: FakeReader())
+
+    entities = S1ExperimentService._load_graph_entities("graph-test")
+
+    assert len(entities) == 1
+    assert entities[0].name == "COMPANY_006"
+    assert entities[0].labels == []
+
+
+def test_source_resolver_maps_legacy_issuer_alias_to_anonymous_graph_company():
+    scenario = FinancialScenario(
+        scenario_id="SCN_ALIAS",
+        symbol="ASSET_014",
+        name="COMPANY_014",
+        prediction_cutoff="T+0d",
+        horizon="next_5_trading_days",
+        seed_events=[
+            {
+                "event_id": f"EVT_ALIAS_{index}",
+                "text": "ST岩石公告，公司披露一项历史事项。",
+            }
+            for index in range(1, 6)
+        ],
+        current_event={
+            "event_id": "EVT_ALIAS_6",
+            "text": "COMPANY_014公告，公司披露当前事项。",
+        },
+    )
+    graph_entity = EntityNode(
+        uuid="zep-company-014",
+        name="COMPANY_014",
+        labels=["Company"],
+        summary="anonymous company",
+        attributes={},
+    )
+
+    sources, events, _mapping = FinanceEventSourceResolver([graph_entity]).resolve(
+        scenario,
+        source_agent_start=20,
+        source_mode="graph",
+        graph_id="graph-alias",
+    )
+
+    assert len(sources) == 1
+    assert sources[0]["source_entity_uuid"] == "zep-company-014"
+    assert all(event["publisher_origin"] == "zep_graph" for event in events)
+    assert all(
+        "graph_scenario_company_alias" in event["publisher_resolution"]
+        for event in events[:5]
+    )
+
+
+def test_source_resolver_uses_unique_graph_type_when_display_name_differs():
+    scenario = FinancialScenario(
+        scenario_id="SCN_MEDIA_ALIAS",
+        symbol="ASSET_MEDIA",
+        name="COMPANY_999",
+        prediction_cutoff="T+0d",
+        horizon="next_5_trading_days",
+        seed_events=[
+                {
+                    "event_id": f"EVT_MEDIA_{index}",
+                    "text": "\u8d22\u7ecf\u5a92\u4f53B\u7535\uff0cCOMPANY_999\u516c\u544a\u3002",
+                }
+            for index in range(1, 6)
+        ],
+        current_event={"event_id": "EVT_MEDIA_6", "text": "COMPANY_999公告。"},
+    )
+    graph_entities = [
+        EntityNode(
+            uuid="zep-media",
+            name="BT-13d",
+            labels=["MediaOutlet"],
+            summary="financial media",
+            attributes={},
+        ),
+        EntityNode(
+            uuid="zep-company",
+            name="COMPANY_999",
+            labels=["Company"],
+            summary="anonymous company",
+            attributes={},
+        ),
+    ]
+
+    sources, events, _mapping = FinanceEventSourceResolver(graph_entities).resolve(
+        scenario,
+        source_agent_start=20,
+        source_mode="graph",
+        graph_id="graph-media-alias",
+    )
+
+    assert {source["source_entity_id"] for source in sources} == {
+        "zep-media",
+        "zep-company",
+    }
+    assert all("graph_unique_type" in event["publisher_resolution"] for event in events[:5])
+
+
+def test_source_resolver_preserves_date_bearing_media_ids_and_audits_missing_graph_nodes():
+    from app.finance.dataset import FinancialScenario
+
+    scenario = FinancialScenario(
+        scenario_id="SCN_MEDIA_DATED",
+        symbol="ASSET_MEDIA_DATED",
+        name="COMPANY_003",
+        prediction_cutoff="T+0d",
+        horizon="next_5_trading_days",
+        seed_events=[
+            {
+                "event_id": "EVT_MEDIA_53",
+                "text": "财经媒体BT-53d电，COMPANY_003公告。",
+            },
+            {
+                "event_id": "EVT_MEDIA_9",
+                "text": "财经媒体BT-9d电，COMPANY_003公告。",
+            },
+            *[
+                {
+                    "event_id": f"EVT_MEDIA_{index}",
+                    "text": "COMPANY_003公告。",
+                }
+                for index in range(3)
+            ],
+        ],
+        current_event={
+            "event_id": "EVT_MEDIA_CURRENT",
+            "text": "财经媒体BT+0d电，COMPANY_003公告。",
+        },
+    )
+    graph_entities = [
+        EntityNode(
+            uuid="zep-company",
+            name="COMPANY_003",
+            labels=["Company"],
+            summary="anonymous company",
+            attributes={},
+        ),
+        EntityNode(
+            uuid="zep-media-53",
+            name="BT-53d",
+            labels=["MediaOutlet"],
+            summary="financial media",
+            attributes={},
+        ),
+        EntityNode(
+            uuid="zep-media-41",
+            name="BT-41d",
+            labels=["MediaOutlet"],
+            summary="financial media",
+            attributes={},
+        ),
+        EntityNode(
+            uuid="zep-media-34",
+            name="BT-34d",
+            labels=["MediaOutlet"],
+            summary="financial media",
+            attributes={},
+        ),
+    ]
+
+    sources, events, _mapping = FinanceEventSourceResolver(graph_entities).resolve(
+        scenario,
+        source_agent_start=20,
+        source_mode="graph",
+        graph_id="graph-media-dated",
+    )
+
+    by_event = {event["event_id"]: event for event in events}
+    assert by_event["EVT_MEDIA_53"]["publisher_name"] == "BT-53d"
+    assert by_event["EVT_MEDIA_53"]["publisher_origin"] == "zep_graph"
+    assert "财经媒体BT-9d" in {source["name"] for source in sources}
+    assert "财经媒体BT+0d" in {source["name"] for source in sources}
+    assert "graph_missing_publisher_text_fallback" in by_event["EVT_MEDIA_9"]["publisher_resolution"]
+    assert "graph_missing_publisher_text_fallback" in by_event["EVT_MEDIA_CURRENT"]["publisher_resolution"]
+
+
+def test_s1_batch_summary_lock_does_not_raise(monkeypatch, tmp_path):
+    runner = S1BatchRunner(storage_dir=tmp_path)
+    manifest = {}
+    monkeypatch.setattr(
+        runner,
+        "_write_summary",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("locked")),
+    )
+
+    assert runner._try_write_summary(tmp_path, manifest) is False
+    assert "locked" in manifest["summary_write_error"]
 
 
 def test_source_resolver_uses_one_public_feed_only_when_attribution_is_missing():
@@ -427,9 +641,9 @@ def test_s1_exports_complete_oasis_trace_with_social_rounds(monkeypatch, tmp_pat
     (sim_dir / "reddit" / "actions.jsonl").write_text(
         "\n".join([
             json.dumps({"event_type": "round_start", "round": 1, "timestamp": "2026-01-01T00:00:01"}),
-            json.dumps({"event_type": "round_end", "round": 1, "timestamp": "2026-01-01T00:00:02"}),
+            json.dumps({"event_type": "round_end", "round": 1, "timestamp": "2026-01-01T00:00:02", "trace_start_rowid": 1, "trace_end_rowid": 2}),
             json.dumps({"event_type": "round_start", "round": 2, "timestamp": "2026-01-01T00:00:03"}),
-            json.dumps({"event_type": "round_end", "round": 2, "timestamp": "2026-01-01T00:00:04"}),
+            json.dumps({"event_type": "round_end", "round": 2, "timestamp": "2026-01-01T00:00:04", "trace_start_rowid": 2, "trace_end_rowid": 4}),
         ]),
         encoding="utf-8",
     )
@@ -440,9 +654,10 @@ def test_s1_exports_complete_oasis_trace_with_social_rounds(monkeypatch, tmp_pat
         connection.executemany(
             "INSERT INTO trace VALUES (?, ?, ?, ?)",
             [
-                (20, "2026-01-01 00:00:00.500000", "create_post", '{"content":"current"}'),
+                (20, "2026-01-01 00:00:00.500000", "create_post", '{"content":"current","post_id":1}'),
                 (0, "2026-01-01 00:00:01.500000", "refresh", '{"posts":[]}'),
-                (0, "2026-01-01 00:00:03.500000", "create_comment", '{"content":"reply"}'),
+                (0, "2026-01-01 00:00:03.400000", "create_comment", '{"content":"reply","comment_id":1}'),
+                (0, "2026-01-01 00:00:03.500000", "like_post", '{"post_id":1}'),
                 (0, "2026-01-01 00:00:04.500000", "interview", '{"prompt":"private"}'),
             ],
         )
@@ -453,11 +668,17 @@ def test_s1_exports_complete_oasis_trace_with_social_rounds(monkeypatch, tmp_pat
         (20, 0, "create_post"),
         (0, 1, "refresh"),
         (0, 2, "create_comment"),
+        (0, 2, "like_post"),
     ]
-    assert records[-1]["action_args"]["content"] == "reply"
+    assert records[2]["action_args"]["content"] == "reply"
+    assert records[0]["round_source"] == "source_initialization"
+    assert records[1]["round_source"] == "oasis_trace_rowid_range"
+    assert records[-1]["target_agent_id"] == 20
+    assert records[2]["target_comment_id"] is None
     counts = service._social_counts(run_dir)
-    assert counts[0]["total"] == 2
+    assert counts[0]["total"] == 3
     assert counts[0]["comment"] == 1
+    assert counts[0]["like"] == 1
 
 
 def test_s1_run_id_rejects_path_traversal(tmp_path):
@@ -465,3 +686,135 @@ def test_s1_run_id_rejects_path_traversal(tmp_path):
 
     with pytest.raises(ValueError, match="invalid S1"):
         service.get_status("../s1_reddit_escape")
+
+
+def test_s1_round_belief_snapshots_keep_round_alignment_and_missing_rows(
+    monkeypatch, tmp_path
+):
+    simulation_dir = tmp_path / "simulations"
+    monkeypatch.setattr(SimulationManager, "SIMULATION_DATA_DIR", str(simulation_dir))
+    service = S1ExperimentService(storage_dir=tmp_path / "finance")
+    manifest = service.prepare(
+        scenario_id="SCN_001", source_mode="scenario", social_rounds=2
+    )
+    run_dir = tmp_path / "finance" / manifest["run_id"]
+    profiles = json.loads((run_dir / "profiles.json").read_text(encoding="utf-8"))
+    from app.finance.dataset import FinancialDatasetLoader
+
+    loaded_scenario = FinancialDatasetLoader().load(scenario_ids=["SCN_001"])[0]
+    pre = [
+        {
+            "scenario_id": "SCN_001",
+            "agent_id": int(profile["user_id"]),
+            "status": "ok",
+            "direction": "neutral",
+            "up_probability": 0.2,
+            "neutral_probability": 0.6,
+            "down_probability": 0.2,
+            "expected_return": 0.0,
+            "confidence": 0.5,
+            "evidence_event_ids": [],
+        }
+        for profile in profiles
+    ]
+    raw = json.dumps(
+        {
+            "direction": "up",
+            "up_probability": 0.6,
+            "neutral_probability": 0.25,
+            "down_probability": 0.15,
+            "expected_return": 0.02,
+            "confidence": 0.6,
+            "evidence_event_ids": ["EVT_0001"],
+            "reason": "round snapshot",
+        },
+        ensure_ascii=False,
+    )
+    simulation_run_dir = simulation_dir / manifest["simulation_id"]
+    simulation_run_dir.mkdir(parents=True, exist_ok=True)
+    (simulation_run_dir / "round_belief_interviews.jsonl").write_text(
+        json.dumps(
+            {
+                "round": 1,
+                "success": True,
+                "attempt_count": 1,
+                "results": {
+                    str(profile["user_id"]): {"response": raw}
+                    for profile in profiles
+                },
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    snapshots = service._parse_round_belief_snapshots(
+        run_dir, manifest, loaded_scenario, profiles, pre
+    )
+
+    assert len(snapshots) == 20 * 3
+    assert {item["round"] for item in snapshots} == {0, 1, 2}
+    assert sum(item["status"] == "ok" for item in snapshots if item["round"] == 0) == 20
+    assert sum(item["status"] == "ok" for item in snapshots if item["round"] == 1) == 20
+    assert sum(item["status"] == "missing" for item in snapshots if item["round"] == 2) == 20
+    assert all(item["snapshot_source"] == "private_round_interview" for item in snapshots if item["round"] == 1)
+
+
+def test_s1_exposure_edges_preserve_content_and_auditable_stance(tmp_path):
+    service = S1ExperimentService(storage_dir=tmp_path / "finance")
+    run_dir = tmp_path / "finance" / "s1_reddit_exposure_test"
+    run_dir.mkdir(parents=True)
+    manifest = {
+        "run_id": "s1_reddit_exposure_test",
+        "replicate_id": "rep-1",
+        "agent_set_version": "n20_full",
+        "sampling_method": "full",
+        "data_split": "calibration",
+        "input_snapshot_hash": "hash",
+        "prompt_version": "v1",
+        "prompt_hash": "prompt",
+        "random_seed": 1,
+        "scenario_id": "SCN_001",
+    }
+    actions = [
+        {
+            "trace_id": 1,
+            "agent_class": "source",
+            "agent_id": 20,
+            "round": 0,
+            "timestamp": "2026-01-01T00:00:00",
+            "action_type": "create_post",
+            "post_id": 1,
+            "action_args": {"content": "这是一条明确的利好消息"},
+        },
+        {
+            "trace_id": 2,
+            "agent_class": "investor",
+            "agent_id": 0,
+            "round": 1,
+            "timestamp": "2026-01-01T00:01:00",
+            "action_type": "refresh",
+            "visible_post_ids": [1],
+        },
+        {
+            "trace_id": 3,
+            "agent_class": "investor",
+            "agent_id": 0,
+            "round": 1,
+            "timestamp": "2026-01-01T00:02:00",
+            "action_type": "like_post",
+            "target_post_id": 1,
+            "post_id": 1,
+        },
+    ]
+
+    edges = service._build_exposure_edges(run_dir, manifest, actions)
+
+    assert len(edges) == 2
+    assert {edge["exposure_type"] for edge in edges} == {"feed_visible", "direct_action"}
+    assert all(edge["viewer_agent_id"] == 0 for edge in edges)
+    assert all(edge["author_agent_id"] == 20 for edge in edges)
+    assert all(edge["content_stance"] == "informational" for edge in edges)
+    assert all(edge["stance_source"] == "source_event" for edge in edges)
+    assert all(edge["first_seen_round"] == 1 for edge in edges)

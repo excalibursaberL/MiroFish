@@ -28,6 +28,14 @@ class Config:
     LLM_API_KEY = os.environ.get('LLM_API_KEY')
     LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'https://api.openai.com/v1')
     LLM_MODEL_NAME = os.environ.get('LLM_MODEL_NAME', 'gpt-4o-mini')
+
+    # Offline content-stance annotation uses a separately configurable model.
+    # The annotator falls back to the main LLM settings only for convenience;
+    # research runs should set these variables explicitly to keep the coder
+    # independent from the investor Agents.
+    STANCE_LLM_API_KEY = os.environ.get('STANCE_LLM_API_KEY')
+    STANCE_LLM_BASE_URL = os.environ.get('STANCE_LLM_BASE_URL')
+    STANCE_LLM_MODEL_NAME = os.environ.get('STANCE_LLM_MODEL_NAME')
     
     # Zep配置
     ZEP_API_KEY = os.environ.get('ZEP_API_KEY')

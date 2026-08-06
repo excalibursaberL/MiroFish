@@ -79,6 +79,20 @@ export const getS1RedditActions = (runId, limit = 100) => {
   return service.get(`/api/finance/s1/reddit/${encodeURIComponent(runId)}/actions`, { params: { limit } })
 }
 
+// Content stance is annotated offline after the social run, so this call does
+// not alter the Agent interaction trace.
+export const annotateS1RedditStances = (runId, force = false) => {
+  return service.post(`/api/finance/s1/reddit/${encodeURIComponent(runId)}/stance-annotate`, { force }, { timeout: 0 })
+}
+
+export const getS1RedditStanceAnnotations = (runId) => {
+  return service.get(`/api/finance/s1/reddit/${encodeURIComponent(runId)}/stance-annotations`)
+}
+
+export const getS1RedditAnnotatedExposureEdges = (runId) => {
+  return service.get(`/api/finance/s1/reddit/${encodeURIComponent(runId)}/exposure-edges-annotated`)
+}
+
 export const getS1RedditMapping = (runId) => {
   return service.get(`/api/finance/s1/reddit/${encodeURIComponent(runId)}/mapping`)
 }

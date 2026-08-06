@@ -435,6 +435,17 @@ class RedditSimulationRunner:
         """获取数据库路径"""
         return os.path.join(self.simulation_dir, "reddit_simulation.db")
 
+    def _trace_max_rowid(self) -> int:
+        """Return the committed OASIS trace boundary for round attribution."""
+        db_path = self._get_db_path()
+        if not os.path.exists(db_path):
+            return 0
+        with sqlite3.connect(db_path) as connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(rowid), 0) FROM trace"
+            ).fetchone()
+        return int(row[0] or 0) if row else 0
+
     def _log_finance_record(self, record: Dict[str, Any]) -> None:
         """Write the action/event contract consumed by SimulationRunner."""
         if not self.finance_s1:
@@ -470,6 +481,106 @@ class RedditSimulationRunner:
                 ("down_probability", "down"),
             )
         )
+
+    async def _run_finance_belief_snapshot(self, round_number: int) -> Dict[str, Any]:
+        """Measure every investor's current belief after one social round.
+
+        These are private ``INTERVIEW`` actions.  They are deliberately
+        excluded from ``social_actions.jsonl`` and are stored separately so a
+        belief measurement cannot be mistaken for a social influence event.
+        A failed measurement is persisted and does not stop the social run;
+        the adapter later emits explicit ``status=missing`` rows per Agent.
+        """
+        finance = self.finance_s1 or {}
+        if not finance.get("belief_snapshot_enabled", True):
+            return {
+                "round": round_number,
+                "success": False,
+                "error": "belief snapshots disabled",
+                "results": {},
+                "attempts": [],
+                "attempt_count": 0,
+            }
+        templates = finance.get("round_belief_snapshot_interviews") or []
+        interviews = []
+        for item in templates:
+            rendered = dict(item)
+            rendered["prompt"] = str(item.get("prompt", "")).replace(
+                "__ROUND_NUMBER__", str(round_number)
+            )
+            rendered["retry_prompt"] = str(item.get("retry_prompt", rendered["prompt"])).replace(
+                "__ROUND_NUMBER__", str(round_number)
+            )
+            interviews.append(rendered)
+        if not interviews:
+            payload = {
+                "round": round_number,
+                "success": False,
+                "error": "round_belief_snapshot_interviews is empty",
+                "results": {},
+                "attempts": [],
+                "attempt_count": 0,
+            }
+        else:
+            attempts: List[Dict[str, Any]] = []
+            try:
+                first = await self.ipc_handler.execute_batch_interviews(interviews)
+                for result in first.get("results", {}).values():
+                    if isinstance(result, dict):
+                        result["attempt_count"] = 1
+                attempts.append({"attempt": 1, "result": first})
+                invalid_ids = {
+                    int(agent_id)
+                    for agent_id, result in first.get("results", {}).items()
+                    if not self._is_valid_finance_forecast_response(result)
+                }
+                if invalid_ids:
+                    retry_interviews = [
+                        {
+                            "agent_id": int(item["agent_id"]),
+                            "prompt": item.get("retry_prompt") or item.get("prompt", ""),
+                        }
+                        for item in interviews
+                        if int(item["agent_id"]) in invalid_ids
+                    ]
+                    retry = await self.ipc_handler.execute_batch_interviews(retry_interviews)
+                    for result in retry.get("results", {}).values():
+                        if isinstance(result, dict):
+                            result["attempt_count"] = 2
+                    attempts.append({"attempt": 2, "result": retry})
+                    first["results"].update(retry.get("results", {}))
+                payload = {
+                    "round": round_number,
+                    "success": True,
+                    "results": first.get("results", {}),
+                    "attempts": attempts,
+                    "attempt_count": len(attempts),
+                }
+            except Exception as error:
+                payload = {
+                    "round": round_number,
+                    "success": False,
+                    "error": str(error),
+                    "results": {},
+                    "attempts": attempts,
+                    "attempt_count": max(1, len(attempts)),
+                }
+        payload["timestamp"] = datetime.now().isoformat()
+        snapshot_path = os.path.join(
+            self.simulation_dir, "round_belief_interviews.jsonl"
+        )
+        with open(snapshot_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self._log_finance_record(
+            {
+                "event_type": "belief_snapshot_completed",
+                "round": round_number,
+                "timestamp": payload["timestamp"],
+                "success": payload["success"],
+                "attempt_count": payload["attempt_count"],
+            }
+        )
+        return payload
 
     def _create_model(self):
         """
@@ -772,6 +883,7 @@ class RedditSimulationRunner:
             simulated_minutes = round_num * minutes_per_round
             simulated_hour = (simulated_minutes // 60) % 24
             simulated_day = simulated_minutes // (60 * 24) + 1
+            trace_start_rowid = self._trace_max_rowid() if self.finance_s1 else 0
 
             if self.finance_s1:
                 self._log_finance_record(
@@ -794,9 +906,12 @@ class RedditSimulationRunner:
                             "event_type": "round_end",
                             "round": round_num + 1,
                             "simulated_hours": simulated_minutes / 60,
+                            "trace_start_rowid": trace_start_rowid,
+                            "trace_end_rowid": trace_start_rowid,
                             "timestamp": datetime.now().isoformat(),
                         }
                     )
+                    await self._run_finance_belief_snapshot(round_num + 1)
                 continue
             
             actions = {
@@ -805,6 +920,7 @@ class RedditSimulationRunner:
             }
             
             await self.env.step(actions)
+            trace_end_rowid = self._trace_max_rowid() if self.finance_s1 else 0
 
             if self.finance_s1:
                 for agent_id, _agent in active_agents:
@@ -826,9 +942,12 @@ class RedditSimulationRunner:
                         "event_type": "round_end",
                         "round": round_num + 1,
                         "simulated_hours": simulated_minutes / 60,
+                        "trace_start_rowid": trace_start_rowid,
+                        "trace_end_rowid": trace_end_rowid,
                         "timestamp": datetime.now().isoformat(),
                     }
                 )
+                await self._run_finance_belief_snapshot(round_num + 1)
             
             if (round_num + 1) % 10 == 0 or round_num == 0:
                 elapsed = (datetime.now() - start_time).total_seconds()
