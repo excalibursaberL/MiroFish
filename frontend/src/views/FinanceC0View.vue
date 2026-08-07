@@ -17,12 +17,12 @@
         <div>
           <p class="eyebrow">FINANCE ADAPTER / CONTROL GROUP</p>
           <h1>{{ experimentMode === 'all' ? '全场景 C0 批量实验' : '单场景 C0 实验工作台' }}</h1>
-          <p class="intro-copy">{{ experimentMode === 'all' ? '一次冻结全部匿名场景，在后台依次完成预测并生成可分析的 CSV。' : '选择一条匿名历史场景，让 20 个投资者 Agent 在看不到彼此观点的情况下分别完成一次预测。' }}</p>
+          <p class="intro-copy">{{ experimentMode === 'all' ? '一次冻结全部匿名场景，在后台依次完成预测并生成可分析的 CSV。' : '选择一条匿名历史场景，让筛选出的 10 个投资者 Agent 在看不到彼此观点的情况下分别完成一次预测。' }}</p>
         </div>
         <div class="facts" aria-label="实验固定参数">
           <div><strong>{{ experimentMode === 'all' ? scenarios.length : 1 }}</strong><span>匿名场景</span></div>
           <div><strong>5 + 1</strong><span>历史种子 + 当前事件</span></div>
-          <div><strong>20</strong><span>独立 Agent</span></div>
+          <div><strong>10</strong><span>独立 Agent</span></div>
           <div><strong>0</strong><span>社会互动</span></div>
         </div>
       </section>
@@ -58,7 +58,7 @@
             </template>
 
             <div v-else class="batch-summary">
-              <strong>{{ scenarios.length }} 个场景 · {{ scenarios.length * 20 }} 次预测</strong>
+              <strong>{{ scenarios.length }} 个场景 · {{ scenarios.length * 10 }} 次预测</strong>
               <span>后台顺序执行；运行中可以关闭页面，后端不可停止。</span>
             </div>
 
@@ -107,7 +107,7 @@
             </label>
 
             <button class="run-button" type="button" :disabled="!canRun" @click="executeExperiment">
-              {{ running ? `正在运行 ${completedCount}/${expectedCount}` : (manifest?.status === 'failed' && isBatchRun ? `继续剩余 ${expectedCount - completedCount} 次预测` : (isBatchRun ? `一键运行全部 ${expectedCount} 次预测` : '正式运行 20 个 Agent')) }}
+              {{ running ? `正在运行 ${completedCount}/${expectedCount}` : (manifest?.status === 'failed' && isBatchRun ? `继续剩余 ${expectedCount - completedCount} 次预测` : (isBatchRun ? `一键运行全部 ${expectedCount} 次预测` : '正式运行 10 个 Agent')) }}
             </button>
 
             <button v-if="hasRun && !running" class="text-button" type="button" @click="resetWorkbench">重新选择场景</button>
@@ -173,6 +173,7 @@
             <div v-if="hasRun && (predictions.length || manifest?.status === 'completed')" class="csv-actions">
               <a :href="csvUrl('predictions')">下载预测 CSV</a>
               <a v-if="manifest?.status === 'completed'" :href="csvUrl('evaluation')">下载评测 CSV</a>
+              <a v-if="manifest?.status === 'completed'" :href="csvUrl('agent_token_usage')">下载 Agent Token CSV</a>
               <span>评测 CSV 仅在全部 Agent 完成后生成。</span>
             </div>
 
@@ -299,7 +300,7 @@ const isBatchRun = computed(() => (manifest.value?.run_mode || experimentMode.va
 const canPrepare = computed(() => !hasRun.value && !busy.value && (experimentMode.value === 'all' ? scenarios.value.length > 0 : Boolean(selectedScenarioId.value)))
 const dryRunReady = computed(() => ['dry_run', 'running', 'completed', 'failed'].includes(manifest.value?.status))
 const canRun = computed(() => hasRun.value && dryRunReady.value && promptConfirmed.value && !busy.value && manifest.value?.status !== 'completed')
-const expectedCount = computed(() => manifest.value?.expected_prediction_count || manifest.value?.agent_count || 20)
+const expectedCount = computed(() => manifest.value?.expected_prediction_count || manifest.value?.agent_count || 10)
 const completedCount = computed(() => manifest.value?.completed_prediction_count ?? manifest.value?.prediction_count ?? predictions.value.length)
 const failedCount = computed(() => predictions.value.filter(item => item.status !== 'ok').length)
 const progressPercent = computed(() => expectedCount.value ? Math.min(100, Math.round((completedCount.value / expectedCount.value) * 100)) : 0)

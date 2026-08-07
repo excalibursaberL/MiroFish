@@ -17,6 +17,7 @@ class C0Forecast:
     agent_role_label: str
     as_of: str
     horizon: str
+    full_population_agent_id: Optional[int] = None
     agent_knowledge_level: Optional[str] = None
     agent_analysis_style: Optional[str] = None
     agent_risk_attitude: Optional[str] = None
@@ -44,6 +45,7 @@ class C0Forecast:
         return {
             "scenario_id": self.scenario_id,
             "agent_id": self.agent_id,
+            "full_population_agent_id": self.full_population_agent_id,
             "agent_role": self.agent_role,
             "agent_role_category": self.agent_role_category,
             "agent_role_label": self.agent_role_label,

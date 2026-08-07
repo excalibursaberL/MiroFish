@@ -60,6 +60,12 @@ def test_combination_array_is_complete_and_lexicographic():
     assert len({tuple(row) for row in combinations.tolist()}) == 10
 
 
+def test_all_nonempty_proper_subsets_of_twenty_have_expected_count():
+    total = sum(len(MODULE.combination_array(20, k)) for k in range(1, 20))
+
+    assert total == (1 << 20) - 2
+
+
 def test_pareto_front_3d_marks_only_nondominated_points():
     values = np.asarray(
         [

@@ -16,7 +16,12 @@ from app.finance.evaluator import (
     FinancialOutcomeEvaluator,
 )
 from app.finance.models import C0Forecast
-from app.finance.roles import build_c0_profiles, iter_c0_roles
+from app.finance.roles import (
+    SELECTED_AGENT_IDS,
+    build_c0_profiles,
+    build_full_c0_profiles,
+    iter_c0_roles,
+)
 
 
 def test_c0_role_mix_is_fixed():
@@ -31,10 +36,14 @@ def test_c0_role_mix_is_fixed():
         "retail_basic": 8,
         "retail_novice": 3,
     }
-    profiles = build_c0_profiles()
-    assert len(profiles) == 20
+    full_profiles = build_full_c0_profiles()
+    assert len(full_profiles) == 20
 
-    retail = [profile for profile in profiles if profile["role_category"] != "institution"]
+    retail = [
+        profile
+        for profile in full_profiles
+        if profile["role_category"] != "institution"
+    ]
     assert Counter(profile["knowledge_level"] for profile in retail) == {
         "experienced": 6,
         "basic": 8,
@@ -55,10 +64,26 @@ def test_c0_role_mix_is_fixed():
         "fundamental": 7,
         "technical": 10,
     }
-    assert all(profile["profile_version"] == "survey2019_twinmarket_minimal_v1" for profile in profiles)
-    assert profiles[0]["profile_sources"]["risk_attitude"] == "institutional_role_design"
+    assert all(
+        profile["profile_version"] == "survey2019_twinmarket_minimal_v1"
+        for profile in full_profiles
+    )
+    assert full_profiles[0]["profile_sources"]["risk_attitude"] == "institutional_role_design"
     assert retail[0]["profile_sources"]["risk_attitude"] == "SIPF_2019_natural_person_survey"
     assert retail[0]["profile_sources"]["analysis_style"].startswith("TwinMarket_")
+
+    profiles = build_c0_profiles()
+    assert len(profiles) == 10
+    assert [profile["user_id"] for profile in profiles] == list(range(10))
+    assert [
+        profile["full_population_agent_id"] for profile in profiles
+    ] == list(SELECTED_AGENT_IDS)
+    assert Counter(profile["role_category"] for profile in profiles) == {
+        "institution": 1,
+        "retail_mature": 3,
+        "retail_basic": 5,
+        "retail_novice": 1,
+    }
 
 
 def test_default_blind_dataset_has_five_seeds():
@@ -158,21 +183,22 @@ def test_prepare_and_dry_run_do_not_call_llm(tmp_path):
     service = C0ExperimentService(storage_dir=tmp_path)
     manifest = service.prepare(limit=1)
     assert manifest["status"] == "prepared"
-    assert manifest["agent_count"] == 20
+    assert manifest["agent_count"] == 10
     assert manifest["scenario_count"] == 1
-    assert manifest["expected_prediction_count"] == 20
+    assert manifest["expected_prediction_count"] == 10
     assert manifest["prediction_target"]["neutral_threshold"] == pytest.approx(0.017)
     assert manifest["prediction_target"]["expected_return_unit"] == "decimal"
     assert "-1.7%" in manifest["prediction_target"]["direction_definition"]
     assert manifest["files"]["llm_responses"] == "llm_responses.jsonl"
     assert manifest["replicate_id"] == manifest["run_id"]
-    assert manifest["agent_set_version"] == "n20_full"
-    assert manifest["sampling_method"] == "full"
+    assert manifest["agent_set_version"] == "n10_k10_exact_v1"
+    assert manifest["sampling_method"] == "offline_exact_enumeration_k10"
+    assert manifest["selected_full_population_agent_ids"] == list(SELECTED_AGENT_IDS)
     assert len(manifest["input_snapshot_hash"]) == 64
     assert len(manifest["prompt_hash"]) == 64
     run_id = manifest["run_id"]
     prompt_lines = (tmp_path / run_id / "prompts.jsonl").read_text(encoding="utf-8").splitlines()
-    assert len(prompt_lines) == 20
+    assert len(prompt_lines) == 10
     assert all("evaluator_targets" not in line for line in prompt_lines)
     assert all("stock_factors" not in line for line in prompt_lines)
 
@@ -205,12 +231,12 @@ def test_all_mode_prepares_every_scenario_and_rejects_filters(tmp_path):
 
     assert manifest["run_mode"] == "all"
     assert manifest["scenario_count"] == 18
-    assert manifest["agent_count"] == 20
-    assert manifest["expected_prediction_count"] == 360
+    assert manifest["agent_count"] == 10
+    assert manifest["expected_prediction_count"] == 180
     prompt_lines = (tmp_path / manifest["run_id"] / "prompts.jsonl").read_text(
         encoding="utf-8"
     ).splitlines()
-    assert len(prompt_lines) == 360
+    assert len(prompt_lines) == 180
 
     with pytest.raises(ValueError, match="cannot use"):
         service.prepare(run_mode="all", limit=1)
@@ -265,9 +291,9 @@ def test_all_mode_writes_prediction_and_evaluation_csv_without_network(
     completed = service.run(run_id)
 
     assert completed["status"] == "completed"
-    assert completed["completed_prediction_count"] == 360
-    assert completed["successful_prediction_count"] == 360
-    assert call_count == 360
+    assert completed["completed_prediction_count"] == 180
+    assert completed["successful_prediction_count"] == 180
+    assert call_count == 180
 
     with (run_dir / "predictions.csv").open(
         "r", encoding="utf-8-sig", newline=""
@@ -278,15 +304,16 @@ def test_all_mode_writes_prediction_and_evaluation_csv_without_network(
     ) as handle:
         evaluation_rows = list(csv.DictReader(handle))
 
-    assert len(prediction_rows) == 360
-    assert len(evaluation_rows) == 360
+    assert len(prediction_rows) == 180
+    assert len(evaluation_rows) == 180
+    assert prediction_rows[0]["full_population_agent_id"] == "1"
     assert "agent_analysis_style" in prediction_rows[0]
     assert "agent_risk_attitude" in prediction_rows[0]
     assert prediction_rows[0]["run_id"] == run_id
     assert prediction_rows[0]["expected_return_unit"] == "decimal"
     assert float(prediction_rows[0]["expected_return"]) == pytest.approx(0.03)
     assert Counter(row["scenario_id"] for row in prediction_rows) == {
-        f"SCN_{index:03d}": 20 for index in range(1, 19)
+        f"SCN_{index:03d}": 10 for index in range(1, 19)
     }
     assert "actual_five_day_close_direction" not in prediction_rows[0]
     assert evaluation_rows[0]["actual_five_day_close_direction"] in {
@@ -455,12 +482,12 @@ def test_failed_batch_resumes_existing_predictions(monkeypatch, tmp_path):
 
     assert completed["status"] == "completed"
     assert completed["resumed_prediction_count"] == 3
-    assert resumed_calls == 37
-    assert len(service.get_predictions(run_id)) == 40
+    assert resumed_calls == 17
+    assert len(service.get_predictions(run_id)) == 20
     with (tmp_path / run_id / "predictions.csv").open(
         "r", encoding="utf-8-sig", newline=""
     ) as handle:
-        assert len(list(csv.DictReader(handle))) == 40
+        assert len(list(csv.DictReader(handle))) == 20
 
 
 def test_scenario_selector_returns_safe_summaries(tmp_path):
@@ -616,6 +643,36 @@ def test_invalid_json_is_retried_once_with_thinking_disabled(
     assert traces[1]["request"]["messages"][0]["role"] == "system"
     assert "api_key" not in json.dumps(traces, ensure_ascii=False).lower()
 
+    token_traces = [
+        json.loads(line)
+        for line in (tmp_path / "llm_token_usage.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert len(token_traces) == 2
+    assert all(record["agent_id"] == profile["user_id"] for record in token_traces)
+    assert all(record["usage_available"] is True for record in token_traces)
+    assert sum(record["prompt_tokens"] for record in token_traces) == 200
+    assert sum(record["completion_tokens"] for record in token_traces) == 40
+    assert sum(record["total_tokens"] for record in token_traces) == 240
+
+    summary = service._write_token_usage_artifacts(
+        tmp_path,
+        [profile],
+        run_id="c0_one_agent_token_test",
+        scenario_id=scenario.scenario_id,
+    )
+    with (tmp_path / "agent_token_usage.csv").open(
+        "r", encoding="utf-8-sig", newline=""
+    ) as handle:
+        agent_rows = list(csv.DictReader(handle))
+    assert len(agent_rows) == 1
+    assert int(agent_rows[0]["api_call_count"]) == 2
+    assert int(agent_rows[0]["total_tokens"]) == 240
+    assert int(agent_rows[0]["independent_forecast_total_tokens"]) == 240
+    assert summary["agent_count"] == 1
+    assert summary["total_tokens"] == 240
+
 
 def test_prompt_meets_deepseek_json_mode_contract():
     service = C0ExperimentService()
@@ -717,11 +774,11 @@ def test_completed_status_is_repaired_and_dry_run_cannot_overwrite_it(tmp_path):
 
     repaired = service.get_status(run_id)
     assert repaired["status"] == "completed"
-    assert repaired["completed_prediction_count"] == 20
+    assert repaired["completed_prediction_count"] == 10
 
     after_prompt_check = service.run(run_id, dry_run=True)
     assert after_prompt_check["status"] == "completed"
-    assert after_prompt_check["prediction_count"] == 20
+    assert after_prompt_check["prediction_count"] == 10
     assert "last_prompt_check_at" in after_prompt_check
 
 

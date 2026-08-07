@@ -143,6 +143,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=list(DEFAULT_K_VALUES),
     )
     parser.add_argument(
+        "--all-k",
+        action="store_true",
+        help="Enumerate every non-empty proper subset size (K=1..N-1)",
+    )
+    parser.add_argument(
         "--device",
         choices=("auto", "cpu", "cuda"),
         default="auto",
@@ -1080,22 +1085,26 @@ def calculate_batch(
     internal_reciprocal = torch.sum(
         (selection @ tensors["graph_reciprocal"]) * selection, dim=1
     )
-    full_density = tensors["graph_adjacency"].sum() / (
-        tensors["agent_count"] * (tensors["agent_count"] - 1)
-    )
-    subset_density = internal_weight / float(k * (k - 1))
-    density_error = torch.abs(subset_density - full_density) / full_density.clamp_min(
-        EPSILON
-    )
-    full_reciprocity = tensors["graph_reciprocal"].sum() / tensors[
-        "graph_adjacency"
-    ].sum().clamp_min(EPSILON)
-    subset_reciprocity = internal_reciprocal / internal_weight.clamp_min(EPSILON)
-    reciprocity_error = torch.where(
-        internal_weight > EPSILON,
-        torch.abs(subset_reciprocity - full_reciprocity),
-        torch.ones_like(internal_weight),
-    )
+    if k == 1:
+        density_error = torch.ones_like(internal_weight)
+        reciprocity_error = torch.ones_like(internal_weight)
+    else:
+        full_density = tensors["graph_adjacency"].sum() / (
+            tensors["agent_count"] * (tensors["agent_count"] - 1)
+        )
+        subset_density = internal_weight / float(k * (k - 1))
+        density_error = torch.abs(
+            subset_density - full_density
+        ) / full_density.clamp_min(EPSILON)
+        full_reciprocity = tensors["graph_reciprocal"].sum() / tensors[
+            "graph_adjacency"
+        ].sum().clamp_min(EPSILON)
+        subset_reciprocity = internal_reciprocal / internal_weight.clamp_min(EPSILON)
+        reciprocity_error = torch.where(
+            internal_weight > EPSILON,
+            torch.abs(subset_reciprocity - full_reciprocity),
+            torch.ones_like(internal_weight),
+        )
     topology_error = 0.5 * density_error.clamp(max=1.0) + 0.5 * reciprocity_error
 
     community_hits = (selection @ tensors["graph_community"] > 0.0).to(selection.dtype)
@@ -1530,11 +1539,18 @@ def validate_args(args: argparse.Namespace, agent_count: int) -> None:
             raise ValueError(f"K={k} is outside [1, {agent_count}]")
     if len(set(args.k_values)) != len(args.k_values):
         raise ValueError("k-values must not contain duplicates")
+    if args.profile_constraints and min(args.k_values) < len(REQUIRED_ROLE_CATEGORIES):
+        raise ValueError(
+            "K<4 cannot cover all required role categories; use "
+            "--no-profile-constraints for K=1..3"
+        )
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     started = time.perf_counter()
     data = load_data(args.dataset_dir)
+    if args.all_k:
+        args.k_values = list(range(1, len(data.agent_ids)))
     validate_args(args, len(data.agent_ids))
     if args.folds > len(data.scenarios):
         raise ValueError("folds cannot exceed the number of scenarios")
@@ -1596,6 +1612,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "dataset_dir": str(args.dataset_dir.resolve()),
             "output_dir": str(args.output_dir.resolve()),
             "k_values": list(args.k_values),
+            "all_k": args.all_k,
             "batch_size": args.batch_size,
             "top_per_k": args.top_per_k,
             "folds": args.folds,

@@ -18,7 +18,11 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 
-C0_AGENT_COUNT = 20
+FULL_AGENT_COUNT = 20
+SELECTED_AGENT_IDS = (1, 3, 4, 5, 9, 11, 12, 13, 14, 17)
+C0_AGENT_COUNT = len(SELECTED_AGENT_IDS)
+DEFAULT_AGENT_SET_VERSION = "n10_k10_exact_v1"
+DEFAULT_SAMPLING_METHOD = "offline_exact_enumeration_k10"
 PROFILE_VERSION = "survey2019_twinmarket_minimal_v1"
 
 
@@ -264,8 +268,10 @@ def iter_c0_roles() -> List[Dict[str, Any]]:
                 retail_index += 1
             roles.append(role)
             next_id += 1
-    if len(roles) != C0_AGENT_COUNT:
-        raise RuntimeError(f"C0 role configuration must contain {C0_AGENT_COUNT} agents")
+    if len(roles) != FULL_AGENT_COUNT:
+        raise RuntimeError(
+            f"full role configuration must contain {FULL_AGENT_COUNT} agents"
+        )
     if retail_index != 17:
         raise RuntimeError("C0 role configuration must contain 17 retail agents")
     return roles
@@ -292,8 +298,8 @@ def profile_prompt_text(profile: Dict[str, Any]) -> str:
     )
 
 
-def build_c0_profiles() -> List[Dict[str, Any]]:
-    """Create anonymized OASIS-compatible profiles for C0 and later S1 use."""
+def build_full_c0_profiles() -> List[Dict[str, Any]]:
+    """Create the auditable 20-Agent source pool used by subset selection."""
     profiles: List[Dict[str, Any]] = []
     for role in iter_c0_roles():
         name = role["agent_key"]
@@ -325,6 +331,7 @@ def build_c0_profiles() -> List[Dict[str, Any]]:
         profiles.append(
             {
                 "user_id": role["agent_id"],
+                "full_population_agent_id": role["agent_id"],
                 "username": name,
                 "name": name,
                 "bio": f"C0 {role['role_label']}（匿名实验角色）",
@@ -351,5 +358,29 @@ def build_c0_profiles() -> List[Dict[str, Any]]:
                 "profile_version": PROFILE_VERSION,
                 "profile_sources": profile_sources,
             }
+        )
+    return profiles
+
+
+def build_c0_profiles() -> List[Dict[str, Any]]:
+    """Return the fixed K=10 experiment subset with contiguous runtime IDs."""
+    full_profiles = {
+        int(profile["full_population_agent_id"]): profile
+        for profile in build_full_c0_profiles()
+    }
+    profiles: List[Dict[str, Any]] = []
+    for runtime_id, full_population_agent_id in enumerate(SELECTED_AGENT_IDS):
+        try:
+            profile = dict(full_profiles[full_population_agent_id])
+        except KeyError as exc:
+            raise RuntimeError(
+                f"selected Agent {full_population_agent_id} is absent from the full pool"
+            ) from exc
+        profile["user_id"] = runtime_id
+        profile["full_population_agent_id"] = full_population_agent_id
+        profiles.append(profile)
+    if len(profiles) != C0_AGENT_COUNT:
+        raise RuntimeError(
+            f"experiment profile configuration must contain {C0_AGENT_COUNT} agents"
         )
     return profiles

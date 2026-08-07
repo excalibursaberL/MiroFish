@@ -60,6 +60,26 @@ def test_stance_prompt_requires_independent_json_annotation():
     assert "stance_score" in prompt[1]["content"]
 
 
+def test_exposure_only_content_uses_k10_source_agent_mapping():
+    rows = OfflineStanceAnnotator._collect_contents(
+        [],
+        [
+            {
+                "content_type": "post",
+                "content_id": 7,
+                "author_agent_id": 10,
+                "round": 1,
+                "content_text": "A source announcement",
+            }
+        ],
+        source_agent_ids=[10],
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["author_agent_id"] == 10
+    assert rows[0]["author_class"] == "source"
+
+
 def test_annotate_completed_run_writes_auditable_derived_views(tmp_path):
     run_id = "s1_reddit_annotator_test"
     run_dir = tmp_path / run_id
@@ -146,4 +166,3 @@ def test_annotate_completed_run_writes_auditable_derived_views(tmp_path):
     assert enriched[0]["stance_source"] == "offline_llm"
     assert enriched[0]["baseline_stance_source"] == "lexicon_v1"
     assert enriched[0]["stance_confidence"] == 0.88
-

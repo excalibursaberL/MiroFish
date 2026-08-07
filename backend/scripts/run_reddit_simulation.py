@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import signal
@@ -38,6 +39,7 @@ sys.path.insert(0, _backend_dir)
 
 # 加载项目根目录的 .env 文件（包含 LLM_API_KEY 等配置）
 from dotenv import load_dotenv
+from app.finance.token_usage import normalize_token_usage
 from app.utils.openai_chat_compat import deepseek_v4_request_options
 
 _env_file = os.path.join(_project_root, '.env')
@@ -145,13 +147,127 @@ class CommandType:
     CLOSE_ENV = "close_env"
 
 
+class AgentTokenUsageRecorder:
+    """Record provider-reported token usage for each OASIS Agent call."""
+
+    def __init__(self, simulation_dir: str, agent_configs: List[Dict[str, Any]]):
+        self.path = os.path.join(simulation_dir, "llm_token_usage.jsonl")
+        self.phase = "other"
+        self.round_number = None
+        self.agent_metadata = {
+            int(config.get("agent_id", index)): config
+            for index, config in enumerate(agent_configs)
+        }
+        with open(self.path, "w", encoding="utf-8"):
+            pass
+
+    def set_context(self, phase: str, round_number: Optional[int] = None) -> None:
+        self.phase = phase
+        self.round_number = round_number
+
+    @staticmethod
+    def _response_usage(response: Any) -> Any:
+        usage = getattr(response, "usage_dict", None)
+        if usage is not None:
+            return usage
+        provider_response = getattr(response, "response", None)
+        if isinstance(provider_response, dict):
+            return provider_response.get("usage")
+        return getattr(provider_response, "usage", None)
+
+    @staticmethod
+    def _response_model(response: Any, agent: Any) -> str:
+        provider_response = getattr(response, "response", None)
+        if isinstance(provider_response, dict):
+            model = provider_response.get("model")
+        else:
+            model = getattr(provider_response, "model", None)
+        if model:
+            return str(model)
+        backend = getattr(agent, "model_backend", None)
+        return str(getattr(backend, "model_type", "") or "")
+
+    def _append(
+        self,
+        *,
+        agent_id: int,
+        agent: Any,
+        response: Any = None,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        usage = normalize_token_usage(self._response_usage(response))
+        metadata = self.agent_metadata.get(agent_id, {})
+        record = {
+            "recorded_at": datetime.now().isoformat(),
+            "agent_id": agent_id,
+            "full_population_agent_id": metadata.get(
+                "full_population_agent_id"
+            ),
+            "agent_class": metadata.get("agent_class", ""),
+            "phase": self.phase,
+            "round": self.round_number,
+            "model": self._response_model(response, agent),
+            "usage_available": usage["usage_available"],
+            "prompt_tokens": usage["prompt_tokens"],
+            "completion_tokens": usage["completion_tokens"],
+            "total_tokens": usage["total_tokens"],
+            "provider_usage": usage["provider_usage"],
+            "status": "error" if error is not None else "ok",
+            "error": str(error) if error is not None else None,
+        }
+        with open(self.path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
+    def instrument(self, agent_graph: Any) -> None:
+        """Wrap every Agent model call without changing OASIS/CAMEL code."""
+        for agent_id, agent in agent_graph.get_agents():
+            if getattr(agent, "_finance_token_usage_instrumented", False):
+                continue
+            original = agent._aget_model_response
+
+            async def tracked(
+                *args,
+                __agent_id=agent_id,
+                __agent=agent,
+                __original=original,
+                **kwargs,
+            ):
+                try:
+                    response = await __original(*args, **kwargs)
+                except Exception as error:
+                    self._append(
+                        agent_id=__agent_id,
+                        agent=__agent,
+                        error=error,
+                    )
+                    raise
+                self._append(
+                    agent_id=__agent_id,
+                    agent=__agent,
+                    response=response,
+                )
+                return response
+
+            agent._aget_model_response = tracked
+            agent._finance_token_usage_instrumented = True
+
+
 class IPCHandler:
     """IPC命令处理器"""
     
-    def __init__(self, simulation_dir: str, env, agent_graph):
+    def __init__(
+        self,
+        simulation_dir: str,
+        env,
+        agent_graph,
+        token_recorder: Optional[AgentTokenUsageRecorder] = None,
+        finance_mode: bool = False,
+    ):
         self.simulation_dir = simulation_dir
         self.env = env
         self.agent_graph = agent_graph
+        self.token_recorder = token_recorder
+        self.finance_mode = finance_mode
         self.commands_dir = os.path.join(simulation_dir, IPC_COMMANDS_DIR)
         self.responses_dir = os.path.join(simulation_dir, IPC_RESPONSES_DIR)
         self.status_file = os.path.join(simulation_dir, ENV_STATUS_FILE)
@@ -221,6 +337,8 @@ class IPCHandler:
             True 表示成功，False 表示失败
         """
         try:
+            if self.token_recorder:
+                self.token_recorder.set_context("manual_interview")
             # 获取Agent
             agent = self.agent_graph.get_agent(agent_id)
             
@@ -255,6 +373,10 @@ class IPCHandler:
             interviews: [{"agent_id": int, "prompt": str}, ...]
         """
         try:
+            if self.token_recorder:
+                self.token_recorder.set_context(
+                    "post_social_prediction" if self.finance_mode else "manual_interview"
+                )
             result = await self.execute_batch_interviews(interviews)
             self.send_response(command_id, "completed", result=result)
             results = result["results"]
@@ -408,10 +530,17 @@ class RedditSimulationRunner:
         self.config_path = config_path
         self.config = self._load_config()
         self.simulation_dir = os.path.dirname(config_path)
+        self.random_seed_state = self._apply_random_seed(
+            self.config.get("random_seed", 4004)
+        )
         self.wait_for_commands = wait_for_commands
         self.env = None
         self.agent_graph = None
         self.ipc_handler = None
+        self.token_recorder = AgentTokenUsageRecorder(
+            self.simulation_dir,
+            self.config.get("agent_configs", []),
+        )
         self.finance_s1 = self.config.get("finance_s1") or {}
         self._finance_action_count = 0
         self._finance_action_log = os.path.join(
@@ -421,6 +550,56 @@ class RedditSimulationRunner:
             os.makedirs(os.path.dirname(self._finance_action_log), exist_ok=True)
             with open(self._finance_action_log, "w", encoding="utf-8"):
                 pass
+
+    def _apply_random_seed(self, value: Any) -> Dict[str, Any]:
+        """Seed every local random source used by the S1/OASIS process.
+
+        Provider-side LLM sampling is deliberately reported separately: the
+        configured DeepSeek endpoint does not expose a reproducible seed
+        contract, so local scheduling can be fixed while model text may still
+        vary between otherwise identical runs.
+        """
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("random_seed must be an integer")
+        if not 0 <= value <= 0xFFFFFFFF:
+            raise ValueError("random_seed must be between 0 and 4294967295")
+
+        os.environ["PYTHONHASHSEED"] = str(value)
+        random.seed(value)
+        report = {
+            "random_seed": value,
+            "python_random_seeded": True,
+            "python_hash_seed": os.environ["PYTHONHASHSEED"],
+            "numpy_seeded": False,
+            "torch_seeded": False,
+            "llm_provider_seeded": False,
+            "llm_provider_seed_note": (
+                "DeepSeek API does not expose a deterministic seed contract; "
+                "provider output can still vary."
+            ),
+        }
+        try:
+            import numpy as np
+
+            np.random.seed(value)
+            report["numpy_seeded"] = True
+        except ImportError:
+            report["numpy_seed_note"] = "NumPy is not installed"
+        try:
+            import torch
+
+            torch.manual_seed(value)
+            report["torch_seeded"] = True
+        except ImportError:
+            report["torch_seed_note"] = "PyTorch is not installed"
+
+        with open(
+            os.path.join(self.simulation_dir, "random_seed_state.json"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            json.dump(report, handle, ensure_ascii=False, indent=2)
+        return report
         
     def _load_config(self) -> Dict[str, Any]:
         """加载配置文件"""
@@ -473,13 +652,22 @@ class RedditSimulationRunner:
         if not isinstance(payload, dict):
             return False
         probabilities = payload.get("probabilities", payload)
-        return isinstance(probabilities, dict) and all(
-            probabilities.get(long_name, probabilities.get(short_name)) is not None
-            for long_name, short_name in (
-                ("up_probability", "up"),
-                ("neutral_probability", "neutral"),
-                ("down_probability", "down"),
-            )
+        if not isinstance(probabilities, dict):
+            return False
+        try:
+            values = [
+                float(probabilities.get(long_name, probabilities.get(short_name)))
+                for long_name, short_name in (
+                    ("up_probability", "up"),
+                    ("neutral_probability", "neutral"),
+                    ("down_probability", "down"),
+                )
+            ]
+        except (TypeError, ValueError):
+            return False
+        return (
+            all(math.isfinite(value) and 0.0 <= value <= 1.0 for value in values)
+            and sum(values) > 0.0
         )
 
     async def _run_finance_belief_snapshot(self, round_number: int) -> Dict[str, Any]:
@@ -524,6 +712,9 @@ class RedditSimulationRunner:
         else:
             attempts: List[Dict[str, Any]] = []
             try:
+                self.token_recorder.set_context(
+                    "belief_snapshot", round_number
+                )
                 first = await self.ipc_handler.execute_batch_interviews(interviews)
                 for result in first.get("results", {}).values():
                     if isinstance(result, dict):
@@ -724,6 +915,7 @@ class RedditSimulationRunner:
             model=model,
             available_actions=self.AVAILABLE_ACTIONS,
         )
+        self.token_recorder.instrument(self.agent_graph)
         
         db_path = self._get_db_path()
         if os.path.exists(db_path):
@@ -742,7 +934,13 @@ class RedditSimulationRunner:
         print("环境初始化完成\n")
         
         # 初始化IPC处理器
-        self.ipc_handler = IPCHandler(self.simulation_dir, self.env, self.agent_graph)
+        self.ipc_handler = IPCHandler(
+            self.simulation_dir,
+            self.env,
+            self.agent_graph,
+            token_recorder=self.token_recorder,
+            finance_mode=bool(self.finance_s1),
+        )
         self.ipc_handler.update_status("running")
 
         if self.finance_s1:
@@ -817,6 +1015,7 @@ class RedditSimulationRunner:
                 self.simulation_dir, "pre_social_interviews.json"
             )
             try:
+                self.token_recorder.set_context("pre_social_prediction", 0)
                 pre_result = await self.ipc_handler.execute_batch_interviews(
                     pre_interviews
                 )
@@ -918,7 +1117,10 @@ class RedditSimulationRunner:
                 agent: LLMAction()
                 for _, agent in active_agents
             }
-            
+
+            self.token_recorder.set_context(
+                "social_interaction", round_num + 1
+            )
             await self.env.step(actions)
             trace_end_rowid = self._trace_max_rowid() if self.finance_s1 else 0
 

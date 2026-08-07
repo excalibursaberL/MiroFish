@@ -292,8 +292,12 @@ class OfflineStanceAnnotator:
 
     @classmethod
     def _collect_contents(
-        cls, actions: Sequence[Dict[str, Any]], exposures: Sequence[Dict[str, Any]]
+        cls,
+        actions: Sequence[Dict[str, Any]],
+        exposures: Sequence[Dict[str, Any]],
+        source_agent_ids: Optional[Sequence[int]] = None,
     ) -> List[Dict[str, Any]]:
+        source_ids = {int(agent_id) for agent_id in (source_agent_ids or [])}
         by_key: Dict[str, Dict[str, Any]] = {}
         for item in actions:
             action_type = str(item.get("action_type", "")).lower()
@@ -330,12 +334,19 @@ class OfflineStanceAnnotator:
             key = cls._content_key(content_type, content_id)
             if key in by_key:
                 continue
+            author_agent_id = item.get("author_agent_id")
+            try:
+                author_is_source = int(author_agent_id) in source_ids
+            except (TypeError, ValueError):
+                author_is_source = False
             by_key[key] = {
                 "content_key": key,
                 "content_type": content_type,
                 "content_id": content_id,
-                "author_agent_id": item.get("author_agent_id"),
-                "author_class": "source" if (item.get("author_agent_id") or -1) >= 20 else "investor",
+                "author_agent_id": author_agent_id,
+                "author_class": (
+                    "source" if author_is_source else "investor"
+                ),
                 "round": item.get("round"),
                 "parent_content_id": None,
                 "content_text": str(item.get("content_text", "") or ""),
@@ -486,7 +497,22 @@ class OfflineStanceAnnotator:
             raise ValueError("stance annotation requires a completed S1 run")
         actions = self._read_jsonl(run_dir / "social_actions.jsonl")
         exposures = self._read_jsonl(run_dir / "exposure_edges.jsonl")
-        items = self._collect_contents(actions, exposures)
+        source_profiles_path = run_dir / "source_profiles.json"
+        source_profiles = (
+            self._read_json(source_profiles_path)
+            if source_profiles_path.exists()
+            else []
+        )
+        source_agent_ids = [
+            int(profile["user_id"])
+            for profile in source_profiles
+            if profile.get("user_id") is not None
+        ]
+        items = self._collect_contents(
+            actions,
+            exposures,
+            source_agent_ids=source_agent_ids,
+        )
         items = [
             {
                 **item,

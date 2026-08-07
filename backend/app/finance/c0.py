@@ -37,7 +37,19 @@ from .evaluator import (
     FinancialOutcomeEvaluator,
 )
 from .models import C0Forecast
-from .roles import C0_AGENT_COUNT, build_c0_profiles, profile_prompt_text
+from .roles import (
+    C0_AGENT_COUNT,
+    DEFAULT_AGENT_SET_VERSION as K10_AGENT_SET_VERSION,
+    DEFAULT_SAMPLING_METHOD as K10_SAMPLING_METHOD,
+    SELECTED_AGENT_IDS,
+    build_c0_profiles,
+    profile_prompt_text,
+)
+from .token_usage import (
+    AGENT_TOKEN_USAGE_FIELDS,
+    normalize_token_usage,
+    summarize_agent_token_usage,
+)
 
 
 logger = get_logger("mirofish.finance.c0")
@@ -46,6 +58,7 @@ logger = get_logger("mirofish.finance.c0")
 def _forecast_profile_fields(profile: Dict[str, Any]) -> Dict[str, Any]:
     """Copy active profile metadata into researcher-facing forecast records."""
     return {
+        "full_population_agent_id": profile.get("full_population_agent_id"),
         "agent_knowledge_level": profile.get("knowledge_level"),
         "agent_analysis_style": profile.get("analysis_style"),
         "agent_risk_attitude": profile.get("risk_attitude"),
@@ -70,8 +83,8 @@ class C0ExperimentService:
     ATOMIC_REPLACE_INITIAL_DELAY = 0.05
     ATOMIC_REPLACE_MAX_DELAY = 0.4
     PROMPT_VERSION = "finance_forecast_c0_v2"
-    DEFAULT_AGENT_SET_VERSION = "n20_full"
-    DEFAULT_SAMPLING_METHOD = "full"
+    DEFAULT_AGENT_SET_VERSION = K10_AGENT_SET_VERSION
+    DEFAULT_SAMPLING_METHOD = K10_SAMPLING_METHOD
     DEFAULT_DATA_SPLIT = "unspecified"
     RUN_METADATA_FIELDS = (
         "run_id",
@@ -88,6 +101,7 @@ class C0ExperimentService:
         *RUN_METADATA_FIELDS,
         "scenario_id",
         "agent_id",
+        "full_population_agent_id",
         "agent_role",
         "agent_role_category",
         "agent_role_label",
@@ -216,6 +230,9 @@ class C0ExperimentService:
                     {
                         "scenario_id": scenario.scenario_id,
                         "agent_id": profile["user_id"],
+                        "full_population_agent_id": profile[
+                            "full_population_agent_id"
+                        ],
                         "agent_role": profile["role_id"],
                         "system": system_prompt,
                         "user": user_prompt,
@@ -271,6 +288,16 @@ class C0ExperimentService:
             "scenario_count": len(scenarios),
             "scenario_ids": [scenario.scenario_id for scenario in scenarios],
             "agent_count": len(profiles),
+            "selected_full_population_agent_ids": list(SELECTED_AGENT_IDS),
+            "runtime_agent_mapping": [
+                {
+                    "agent_id": int(profile["user_id"]),
+                    "full_population_agent_id": int(
+                        profile["full_population_agent_id"]
+                    ),
+                }
+                for profile in profiles
+            ],
             "expected_prediction_count": len(scenarios) * len(profiles),
             "completed_prediction_count": 0,
             "successful_prediction_count": 0,
@@ -288,6 +315,9 @@ class C0ExperimentService:
                 "predictions_csv": "predictions.csv",
                 "evaluation_csv": "evaluation.csv",
                 "llm_responses": "llm_responses.jsonl",
+                "llm_token_usage": "llm_token_usage.jsonl",
+                "agent_token_usage_csv": "agent_token_usage.csv",
+                "token_usage_summary": "token_usage_summary.json",
             },
         }
         self._write_json(run_dir / "manifest.json", manifest)
@@ -514,7 +544,11 @@ READ={current.get('read', '')} MARKET={current.get('market', '')}
                     user_prompt=user_prompt,
                     response_trace_path=response_trace_path,
                 )
-                record = self._with_run_metadata(forecast.to_dict(), manifest)
+                record = forecast.to_dict()
+                record["full_population_agent_id"] = int(
+                    profile["full_population_agent_id"]
+                )
+                record = self._with_run_metadata(record, manifest)
                 predictions.append(record)
                 completed_key_set.add(prediction_key)
                 self._append_prediction_artifact(run_dir, record, predictions)
@@ -536,6 +570,14 @@ READ={current.get('read', '')} MARKET={current.get('market', '')}
                 self._write_json(run_dir / "manifest.json", manifest)
 
         self._write_evaluation_csv(run_dir, predictions)
+        token_usage = self._write_token_usage_artifacts(
+            run_dir,
+            profiles,
+            run_id=run_id,
+            scenario_id=(
+                scenarios[0].scenario_id if len(scenarios) == 1 else "all"
+            ),
+        )
         manifest.update(
             {
                 "status": "completed",
@@ -549,6 +591,7 @@ READ={current.get('read', '')} MARKET={current.get('market', '')}
                 "last_scenario_count": len(scenarios),
                 "current_scenario_id": None,
                 "current_agent_id": None,
+                "token_usage": token_usage,
                 "updated_at": self._now(),
             }
         )
@@ -577,6 +620,17 @@ READ={current.get('read', '')} MARKET={current.get('market', '')}
         run_dir = self._run_dir(run_id)
         manifest = self._read_json(run_dir / "manifest.json")
         predictions = self.get_predictions(run_id)
+        profiles = self._read_json(run_dir / "profiles.json")
+        token_usage = self._write_token_usage_artifacts(
+            run_dir,
+            profiles,
+            run_id=run_id,
+            scenario_id=(
+                str(manifest.get("scenario_ids", [""])[0])
+                if int(manifest.get("scenario_count", 0) or 0) == 1
+                else "all"
+            ),
+        )
         manifest.update(
             {
                 "status": "failed",
@@ -591,6 +645,7 @@ READ={current.get('read', '')} MARKET={current.get('market', '')}
                 "current_scenario_id": None,
                 "current_agent_id": None,
                 "background_error": str(error),
+                "token_usage": token_usage,
                 "updated_at": self._now(),
             }
         )
@@ -736,6 +791,7 @@ READ={current.get('read', '')} MARKET={current.get('market', '')}
             "recorded_at": self._now(),
             "scenario_id": scenario.scenario_id,
             "agent_id": profile["user_id"],
+            "full_population_agent_id": profile.get("full_population_agent_id"),
             "agent_role": profile["role_id"],
             "attempt_count": attempt_count,
             "request": {
@@ -764,6 +820,39 @@ READ={current.get('read', '')} MARKET={current.get('market', '')}
             ),
         }
         self._append_jsonl(path, record)
+        response_usage = (
+            response.get("usage")
+            if isinstance(response, dict)
+            else getattr(response, "usage", None)
+        )
+        usage = normalize_token_usage(response_usage)
+        self._append_jsonl(
+            path.with_name("llm_token_usage.jsonl"),
+            {
+                "recorded_at": record["recorded_at"],
+                "scenario_id": scenario.scenario_id,
+                "agent_id": profile["user_id"],
+                "full_population_agent_id": profile.get(
+                    "full_population_agent_id"
+                ),
+                "agent_role": profile["role_id"],
+                "phase": "independent_forecast",
+                "round": None,
+                "attempt_count": attempt_count,
+                "model": (
+                    response.get("model")
+                    if isinstance(response, dict)
+                    else getattr(response, "model", None)
+                ) or Config.LLM_MODEL_NAME,
+                "usage_available": usage["usage_available"],
+                "prompt_tokens": usage["prompt_tokens"],
+                "completion_tokens": usage["completion_tokens"],
+                "total_tokens": usage["total_tokens"],
+                "provider_usage": self._json_safe(usage["provider_usage"]),
+                "status": forecast.status,
+                "error": str(exception) if exception is not None else forecast.error,
+            },
+        )
 
     def parse_forecast(
         self,
@@ -959,9 +1048,12 @@ READ={current.get('read', '')} MARKET={current.get('market', '')}
         filenames = {
             "predictions": "predictions.csv",
             "evaluation": "evaluation.csv",
+            "agent_token_usage": "agent_token_usage.csv",
         }
         if kind not in filenames:
-            raise ValueError("CSV kind must be 'predictions' or 'evaluation'")
+            raise ValueError(
+                "CSV kind must be predictions, evaluation, or agent_token_usage"
+            )
         path = self._run_dir(run_id) / filenames[kind]
         if not path.exists():
             if kind == "evaluation":
@@ -1138,6 +1230,30 @@ READ={current.get('read', '')} MARKET={current.get('market', '')}
             records,
             self.PREDICTION_CSV_FIELDS,
         )
+
+    def _write_token_usage_artifacts(
+        self,
+        run_dir: Path,
+        profiles: Sequence[Dict[str, Any]],
+        *,
+        run_id: str,
+        scenario_id: str,
+    ) -> Dict[str, Any]:
+        raw_path = run_dir / "llm_token_usage.jsonl"
+        raw_records = self._read_jsonl(raw_path) if raw_path.exists() else []
+        rows, summary = summarize_agent_token_usage(
+            raw_records,
+            profiles,
+            run_id=run_id,
+            scenario_id=scenario_id,
+        )
+        self._write_csv(
+            run_dir / "agent_token_usage.csv",
+            rows,
+            AGENT_TOKEN_USAGE_FIELDS,
+        )
+        self._write_json(run_dir / "token_usage_summary.json", summary)
+        return summary
 
     def _append_prediction_artifact(
         self,

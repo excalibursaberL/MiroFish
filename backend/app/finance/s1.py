@@ -37,8 +37,15 @@ from .evaluator import (
     FinancialOutcomeEvaluator,
 )
 from .models import C0Forecast
-from .roles import C0_AGENT_COUNT, build_c0_profiles, profile_prompt_text
+from .roles import (
+    C0_AGENT_COUNT,
+    DEFAULT_AGENT_SET_VERSION as K10_AGENT_SET_VERSION,
+    DEFAULT_SAMPLING_METHOD as K10_SAMPLING_METHOD,
+    build_c0_profiles,
+    profile_prompt_text,
+)
 from .source_resolver import FinanceEventSourceResolver
+from .token_usage import AGENT_TOKEN_USAGE_FIELDS, summarize_agent_token_usage
 
 
 logger = get_logger("mirofish.finance.s1")
@@ -53,19 +60,20 @@ class S1ExperimentService:
     DEFAULT_SOCIAL_ROUNDS = 6
     MIN_SOCIAL_ROUNDS = 1
     MAX_SOCIAL_ROUNDS = 12
+    DEFAULT_RANDOM_SEED = 4004
     # The generic runner still requires a time step. It is an internal pacing
     # value only; S1 rounds are interaction steps, not real-world minutes.
     DEFAULT_MINUTES_PER_ROUND = 30
     # OASIS Reddit currently assigns Agent IDs by profile-list position rather
-    # than honoring a profile's user_id. Keep investors first (0-19); dynamic
-    # source accounts then receive contiguous IDs starting at 20.
+    # than honoring a profile's user_id. Keep the K=10 investors first (0-9);
+    # dynamic source accounts then receive contiguous IDs starting at 10.
     SOURCE_AGENT_START = C0_AGENT_COUNT
     RUN_ID_PATTERN = re.compile(r"s1_reddit_[A-Za-z0-9_-]{6,64}")
     _background_lock = threading.Lock()
     _background_threads: Dict[str, threading.Thread] = {}
-    PROMPT_VERSION = "finance_forecast_s1_v2"
-    DEFAULT_AGENT_SET_VERSION = "n20_full"
-    DEFAULT_SAMPLING_METHOD = "full"
+    PROMPT_VERSION = "finance_forecast_s1_v3_unified_belief"
+    DEFAULT_AGENT_SET_VERSION = K10_AGENT_SET_VERSION
+    DEFAULT_SAMPLING_METHOD = K10_SAMPLING_METHOD
     DEFAULT_DATA_SPLIT = "unspecified"
     RUN_METADATA_FIELDS = (
         "run_id",
@@ -85,6 +93,7 @@ class S1ExperimentService:
         "condition",
         "prediction_stage",
         "agent_id",
+        "full_population_agent_id",
         "agent_role",
         "agent_role_category",
         "agent_role_label",
@@ -132,6 +141,7 @@ class S1ExperimentService:
         *RUN_METADATA_FIELDS,
         "scenario_id",
         "agent_id",
+        "full_population_agent_id",
         "agent_role_label",
         "pre_direction",
         "post_direction",
@@ -176,6 +186,7 @@ class S1ExperimentService:
         "snapshot_type",
         "snapshot_source",
         "agent_id",
+        "full_population_agent_id",
         "agent_role",
         "agent_role_category",
         "agent_role_label",
@@ -277,6 +288,39 @@ class S1ExperimentService:
     @staticmethod
     def _write_csv(path: Path, records: Sequence[Dict[str, Any]], fields: Sequence[str]) -> None:
         C0ExperimentService._write_csv(path, records, fields)
+
+    @staticmethod
+    def _read_jsonl(path: Path) -> List[Dict[str, Any]]:
+        return C0ExperimentService._read_jsonl(path)
+
+    def _write_token_usage_artifacts(
+        self,
+        run_dir: Path,
+        simulation_dir: Path,
+        profiles: Sequence[Dict[str, Any]],
+        manifest: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        source_path = simulation_dir / "llm_token_usage.jsonl"
+        run_path = run_dir / "llm_token_usage.jsonl"
+        if source_path.exists():
+            run_path.write_text(
+                source_path.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+        raw_records = self._read_jsonl(run_path) if run_path.exists() else []
+        rows, summary = summarize_agent_token_usage(
+            raw_records,
+            profiles,
+            run_id=str(manifest["run_id"]),
+            scenario_id=str(manifest["scenario_id"]),
+        )
+        self._write_csv(
+            run_dir / "agent_token_usage.csv",
+            rows,
+            AGENT_TOKEN_USAGE_FIELDS,
+        )
+        self._write_json(run_dir / "token_usage_summary.json", summary)
+        return summary
 
     @staticmethod
     def _s1_investor_profiles(
@@ -407,6 +451,14 @@ class S1ExperimentService:
             )
         if source_mode not in {"auto", "graph", "scenario"}:
             raise ValueError("source_mode must be auto, graph, or scenario")
+        if random_seed is None:
+            random_seed = self.DEFAULT_RANDOM_SEED
+        if (
+            isinstance(random_seed, bool)
+            or not isinstance(random_seed, int)
+            or not 0 <= random_seed <= 0xFFFFFFFF
+        ):
+            raise ValueError("random_seed must be an integer between 0 and 4294967295")
         if project_id:
             project = ProjectManager.get_project(project_id)
             if project is None:
@@ -438,6 +490,7 @@ class S1ExperimentService:
             raise ValueError(f"S1 run already exists: {run_id}")
 
         investors = self._s1_investor_profiles(scenario)
+        investor_count = len(investors)
         graph_entities = (
             self._load_graph_entities(str(graph_id))
             if resolved_source_mode == "graph"
@@ -453,6 +506,10 @@ class S1ExperimentService:
         )
         all_profiles = investors + sources
         current_event = self._build_current_event(scenario, event_sources)
+        belief_measurement_prompt = self.build_belief_snapshot_prompt(scenario)
+        belief_measurement_retry_prompt = self.build_belief_snapshot_retry_prompt(
+            scenario
+        )
         run_dir.mkdir(parents=True, exist_ok=True)
         simulation_id = f"finance_{run_id[3:]}"
         total_rounds = social_rounds
@@ -480,18 +537,22 @@ class S1ExperimentService:
                     "agent_id": profile["user_id"],
                     "entity_name": profile["name"],
                     "agent_class": profile.get("agent_class", "source"),
+                    "full_population_agent_id": profile.get(
+                        "full_population_agent_id"
+                    ),
                     "activity_level": 1.0 if is_investor else 0.0,
                     "active_hours": list(range(24)) if is_investor else [],
                 }
             )
         config = {
             "simulation_id": simulation_id,
+            "random_seed": random_seed,
             "llm_model": getattr(Config, "LLM_MODEL_NAME", None) or "deepseek-chat",
             "time_config": {
                 "total_simulation_hours": total_simulation_hours,
                 "minutes_per_round": minutes_per_round,
-                "agents_per_hour_min": C0_AGENT_COUNT,
-                "agents_per_hour_max": C0_AGENT_COUNT,
+                "agents_per_hour_min": investor_count,
+                "agents_per_hour_max": investor_count,
                 "peak_hours": [],
                 "off_peak_hours": [],
             },
@@ -515,6 +576,15 @@ class S1ExperimentService:
                 "social_rounds": social_rounds,
                 "total_rounds": total_rounds,
                 "tracked_agent_ids": [p["user_id"] for p in investors],
+                "investor_agent_mapping": [
+                    {
+                        "agent_id": int(profile["user_id"]),
+                        "full_population_agent_id": int(
+                            profile["full_population_agent_id"]
+                        ),
+                    }
+                    for profile in investors
+                ],
                 "source_agent_ids": [p["user_id"] for p in sources],
                 "history_memory_event_ids": [
                     event.get("event_id") for event in scenario.seed_events
@@ -523,28 +593,16 @@ class S1ExperimentService:
                 "pre_social_interviews": [
                     {
                         "agent_id": int(profile["user_id"]),
-                        "prompt": self.build_forecast_prompt(
-                            scenario, stage="pre_social"
-                        ),
-                        "retry_prompt": self.build_retry_prompt(
-                            scenario, stage="pre_social"
-                        ),
+                        "prompt": belief_measurement_prompt,
+                        "retry_prompt": belief_measurement_retry_prompt,
                     }
                     for profile in investors
                 ],
                 "round_belief_snapshot_interviews": [
                     {
                         "agent_id": int(profile["user_id"]),
-                        "prompt": self.build_belief_snapshot_prompt(
-                            round_number="__ROUND_NUMBER__"
-                        ),
-                        "retry_prompt": (
-                            "The previous private belief snapshot was invalid. "
-                            "Return only the required JSON object.\n\n"
-                            + self.build_belief_snapshot_prompt(
-                                round_number="__ROUND_NUMBER__"
-                            )
-                        ),
+                        "prompt": belief_measurement_prompt,
+                        "retry_prompt": belief_measurement_retry_prompt,
                     }
                     for profile in investors
                 ],
@@ -555,27 +613,14 @@ class S1ExperimentService:
         }
         prompt_hash = self._sha256_json(
             {
-                "pre_social": [
+                "belief_measurement": [
                     {
                         "agent_id": int(profile["user_id"]),
-                        "prompt": self.build_forecast_prompt(
-                            scenario, stage="pre_social"
-                        ),
+                        "prompt": belief_measurement_prompt,
                     }
                     for profile in investors
                 ],
-                "post_social": [
-                    {
-                        "agent_id": int(profile["user_id"]),
-                        "prompt": self.build_forecast_prompt(
-                            scenario, stage="post_social"
-                        ),
-                    }
-                    for profile in investors
-                ],
-                "round_belief_snapshot": self.build_belief_snapshot_prompt(
-                    round_number="__ROUND_NUMBER__"
-                ),
+                "post_social_source": "final_round_belief_snapshot",
             }
         )
         config["finance_s1"].update(
@@ -639,14 +684,29 @@ class S1ExperimentService:
             ),
             "dataset_path": str(loader.dataset_path),
             "scenario_count": 1,
-            "investor_agent_count": C0_AGENT_COUNT,
+            "investor_agent_count": investor_count,
+            "selected_full_population_agent_ids": [
+                int(profile["full_population_agent_id"])
+                for profile in investors
+            ],
+            "runtime_agent_mapping": [
+                {
+                    "agent_id": int(profile["user_id"]),
+                    "full_population_agent_id": int(
+                        profile["full_population_agent_id"]
+                    ),
+                }
+                for profile in investors
+            ],
             "source_agent_count": len(sources),
             "agent_count_total": len(all_profiles),
             "social_rounds": social_rounds,
             "total_rounds": total_rounds,
             "round_semantics": "interaction_step",
             "belief_snapshot_enabled": True,
-            "expected_belief_snapshot_count": C0_AGENT_COUNT * (social_rounds + 1),
+            "post_social_source": "final_round_belief_snapshot",
+            "post_social_extra_interview_enabled": False,
+            "expected_belief_snapshot_count": investor_count * (social_rounds + 1),
             "stance_annotation": {
                 "status": "pending_offline_llm",
                 "prompt_version": "finance_stance_annotation_v1",
@@ -662,7 +722,7 @@ class S1ExperimentService:
             "status": "prepared",
             "created_at": self._now(),
             "updated_at": self._now(),
-            "expected_prediction_count": C0_AGENT_COUNT * 2,
+            "expected_prediction_count": investor_count * 2,
             "completed_prediction_count": 0,
             "successful_prediction_count": 0,
             "failed_prediction_count": 0,
@@ -693,6 +753,10 @@ class S1ExperimentService:
                 "agent_changes_csv": "agent_changes.csv",
                 "round_metrics_csv": "round_metrics.csv",
                 "social_metrics": "social_metrics.json",
+                "llm_token_usage": "llm_token_usage.jsonl",
+                "agent_token_usage_csv": "agent_token_usage.csv",
+                "token_usage_summary": "token_usage_summary.json",
+                "random_seed_state": "random_seed_state.json",
             },
         }
         self._write_json(run_dir / "manifest.json", manifest)
@@ -703,12 +767,9 @@ class S1ExperimentService:
     ) -> str:
         if stage not in {"pre_social", "post_social"}:
             raise ValueError("stage must be pre_social or post_social")
+        if stage == "pre_social":
+            return self.build_belief_snapshot_prompt(scenario)
         stage_text = (
-            "expected_return must use decimal return units: 0.03 means +3%.\n"
-            "这是社会互动开始前的第一次预测。当前事件已经公开，但你还没有看到其他投资者的观点。"
-            "只能根据只读历史记忆、当前公开事件和自己的 Profile 判断。"
-            if stage == "pre_social"
-            else
             "这是社会互动结束后的第二次预测。你已经看过讨论区中其他投资者的公开内容，"
             "请把实际看到的帖子、评论和评价作为社会信息，并结合自己的 Profile、历史记忆和当前事件判断。"
         )
@@ -733,19 +794,33 @@ neutral 只表示预计价格变化很小，不表示没有把握；不确定性
         )
 
     @staticmethod
-    def build_belief_snapshot_prompt(*, round_number: int) -> str:
+    def build_belief_snapshot_prompt(scenario: FinancialScenario) -> str:
         """Build a private, structured belief measurement prompt.
 
-        The prompt is intentionally independent of the social-action protocol.
-        It measures the Agent's current belief without asking it to publish,
-        like, or reply.  ``round_number`` is substituted when the live runner
-        executes the private interview.
+        The exact same prompt is used before social interaction and after every
+        round.  The measurement stage is kept in experiment metadata instead
+        of the prompt so wording changes cannot be mistaken for belief changes.
         """
-        return f"""Private belief measurement after interaction round {round_number}.
-Do not publish a post, write a comment, like, search, or call any tool.  Return exactly one JSON object.
-Use decimal return units: 0.03 means +3%.  Do not use future labels, actual prices, or information not visible in the current simulation.
-The probabilities must be numbers in [0, 1] and sum to 1.
-{{"direction":"up|neutral|down","up_probability":0.0,"neutral_probability":0.0,"down_probability":0.0,"expected_return":0.0,"confidence":0.0,"evidence_event_ids":[],"reason":"brief explanation"}}"""
+        return f"""你正在参加 A 股 S1 社会互动实验中的私有信念测量。
+只根据此刻在模拟中实际可见的信息进行判断。可见信息可能包括只读历史记忆、当前公开事件，以及你已经实际看到的帖子、评论和评价；不要推断尚未看到的内容。
+
+场景：{scenario.scenario_id}
+当前公开事件：[{scenario.current_event.get('event_id')} | {scenario.current_event.get('event_time')}] {scenario.current_event.get('text', '')}
+预测窗口：未来 5 个交易日累计收盘收益
+方向区间：R5 < -1.7% 为 down；-1.7% <= R5 <= +1.7% 为 neutral；R5 > +1.7% 为 up。
+neutral 只表示预计价格变化很小，不表示没有把握；不确定性请用 confidence 和概率分布表达。
+expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必须是 [0, 1] 内的数字且总和为 1。
+这是私有测量，不要发帖、评论、点赞、搜索或调用任何工具。不要使用外部信息，不要猜测匿名企业的真实身份，不要引用未来价格或评测答案。只返回一个 JSON object，不要输出 Markdown 或 JSON 之外的文字：
+{{"direction":"up|neutral|down","up_probability":0.0,"neutral_probability":0.0,"down_probability":0.0,"expected_return":0.0,"confidence":0.0,"evidence_event_ids":[],"reason":"不超过200字，说明你如何使用当前可见信息"}}"""
+
+    def build_belief_snapshot_retry_prompt(
+        self, scenario: FinancialScenario
+    ) -> str:
+        return (
+            "上一次私有信念测量没有返回有效 JSON。不要执行任何社交平台动作，"
+            "只返回要求的 JSON object。\n\n"
+            + self.build_belief_snapshot_prompt(scenario)
+        )
 
     def run_sync(self, run_id: str, *, timeout: float = 900.0) -> Dict[str, Any]:
         run_dir = self._run_dir(run_id)
@@ -756,6 +831,8 @@ The probabilities must be numbers in [0, 1] and sum to 1.
         scenario = FinancialDatasetLoader(manifest.get("dataset_path") or self.dataset_path).load(
             scenario_ids=[manifest["scenario_id"]]
         )[0]
+        simulation_dir = Path(SimulationManager.SIMULATION_DATA_DIR) / simulation_id
+        profiles = self._read_json(run_dir / "profiles.json")
         manifest.update({"status": "running", "updated_at": self._now()})
         self._write_json(run_dir / "manifest.json", manifest)
         try:
@@ -778,9 +855,16 @@ The probabilities must be numbers in [0, 1] and sum to 1.
             else:
                 raise TimeoutError("S1 Reddit simulation did not become interactive in time")
 
-            simulation_dir = (
-                Path(SimulationManager.SIMULATION_DATA_DIR) / simulation_id
-            )
+            seed_state_path = simulation_dir / "random_seed_state.json"
+            if not seed_state_path.exists():
+                raise RuntimeError("OASIS random seed state artifact is missing")
+            seed_state = self._read_json(seed_state_path)
+            if int(seed_state.get("random_seed", -1)) != int(manifest["random_seed"]):
+                raise RuntimeError("OASIS random seed does not match the run manifest")
+            self._write_json(run_dir / "random_seed_state.json", seed_state)
+            manifest["random_seed_state"] = seed_state
+            self._write_json(run_dir / "manifest.json", manifest)
+
             pre_response_path = simulation_dir / "pre_social_interviews.json"
             if not pre_response_path.exists():
                 raise RuntimeError(
@@ -803,7 +887,6 @@ The probabilities must be numbers in [0, 1] and sum to 1.
                 run_dir / "agent_round_states.jsonl",
                 self._build_agent_round_states(run_dir, manifest, actions),
             )
-            profiles = self._read_json(run_dir / "profiles.json")
             pre_predictions = self._parse_interviews(
                 scenario,
                 profiles,
@@ -815,80 +898,6 @@ The probabilities must be numbers in [0, 1] and sum to 1.
             pre_predictions = [
                 self._with_run_metadata(prediction, manifest)
                 for prediction in pre_predictions
-            ]
-            interviews = [
-                {
-                    "agent_id": int(p["user_id"]),
-                    "prompt": self.build_forecast_prompt(
-                        scenario, stage="post_social"
-                    ),
-                }
-                for p in profiles
-            ]
-            response = SimulationRunner.interview_agents_batch(
-                simulation_id, interviews, platform="reddit", timeout=timeout
-            )
-            interview_attempts = [{"attempt": 1, "response": response}]
-            self._write_json(
-                run_dir / "interview_responses.json",
-                {
-                    "pre_social": pre_response,
-                    "post_social": interview_attempts,
-                },
-            )
-            if not response.get("success"):
-                raise RuntimeError(response.get("error") or "S1 forecast interview failed")
-            post_predictions = self._parse_interviews(
-                scenario,
-                profiles,
-                response.get("result", {}).get("results", {}),
-                run_dir,
-                stage="post_social",
-                attempt_count=1,
-            )
-            failed_ids = {
-                int(prediction["agent_id"])
-                for prediction in post_predictions
-                if prediction.get("status") != "ok"
-            }
-            if failed_ids:
-                retry_profiles = [
-                    profile
-                    for profile in profiles
-                    if int(profile["user_id"]) in failed_ids
-                ]
-                retry_response = SimulationRunner.interview_agents_batch(
-                    simulation_id,
-                    [
-                        {
-                            "agent_id": int(profile["user_id"]),
-                            "prompt": self.build_retry_prompt(
-                                scenario, stage="post_social"
-                            ),
-                        }
-                        for profile in retry_profiles
-                    ],
-                    platform="reddit",
-                    timeout=timeout,
-                )
-                interview_attempts.append({"attempt": 2, "response": retry_response})
-                if retry_response.get("success"):
-                    retried = self._parse_interviews(
-                        scenario,
-                        retry_profiles,
-                        retry_response.get("result", {}).get("results", {}),
-                        run_dir,
-                        stage="post_social",
-                        attempt_count=2,
-                    )
-                    retried_by_id = {int(item["agent_id"]): item for item in retried}
-                    post_predictions = [
-                        retried_by_id.get(int(item["agent_id"]), item)
-                        for item in post_predictions
-                    ]
-            post_predictions = [
-                self._with_run_metadata(prediction, manifest)
-                for prediction in post_predictions
             ]
             raw_round_snapshot_path = simulation_dir / "round_belief_interviews.jsonl"
             if raw_round_snapshot_path.exists():
@@ -907,16 +916,33 @@ The probabilities must be numbers in [0, 1] and sum to 1.
                 pre_predictions,
             )
             self._write_jsonl(run_dir / "belief_snapshots.jsonl", belief_snapshots)
+            post_predictions = self._post_predictions_from_final_snapshot(
+                run_dir,
+                manifest,
+                profiles,
+                belief_snapshots,
+            )
             self._write_json(
                 run_dir / "interview_responses.json",
                 {
                     "pre_social": pre_response,
-                    "post_social": interview_attempts,
+                    "post_social": [],
+                    "post_social_derivation": {
+                        "source": "final_round_belief_snapshot",
+                        "round": int(manifest["social_rounds"]),
+                        "extra_llm_call_performed": False,
+                    },
                 },
             )
             combined_predictions = pre_predictions + post_predictions
             changes = self._build_prediction_changes(
                 pre_predictions, post_predictions
+            )
+            token_usage = self._write_token_usage_artifacts(
+                run_dir,
+                simulation_dir,
+                profiles,
+                manifest,
             )
             social_metrics, round_metrics = self._build_social_metrics(
                 run_dir, pre_predictions, post_predictions, changes
@@ -935,6 +961,7 @@ The probabilities must be numbers in [0, 1] and sum to 1.
                 },
             }
             social_metrics["social_behavior"]["exposure_edge_count"] = len(exposure_edges)
+            social_metrics["token_usage"] = token_usage
             social_metrics["artifacts"].update(
                 {
                     "belief_snapshots": "belief_snapshots.jsonl",
@@ -984,18 +1011,38 @@ The probabilities must be numbers in [0, 1] and sum to 1.
                     "direction_flip_rate": social_metrics.get(
                         "group_change", {}
                     ).get("direction_flip_rate"),
+                    "token_usage": token_usage,
                 }
             )
             self._write_json(run_dir / "manifest.json", manifest)
             return manifest
         except Exception as error:
             logger.exception("S1 run failed: %s", run_id)
-            manifest.update({"status": "failed", "error": str(error), "updated_at": self._now()})
-            self._write_json(run_dir / "manifest.json", manifest)
             try:
                 SimulationRunner.close_simulation_env(simulation_id, timeout=20)
             except Exception:
                 pass
+            failure_update = {
+                "status": "failed",
+                "error": str(error),
+                "updated_at": self._now(),
+            }
+            try:
+                failure_update["token_usage"] = self._write_token_usage_artifacts(
+                    run_dir,
+                    simulation_dir,
+                    profiles,
+                    manifest,
+                )
+            except Exception as token_error:
+                logger.exception(
+                    "Could not finalize S1 token usage for %s: %s",
+                    run_id,
+                    token_error,
+                )
+                failure_update["token_usage_error"] = str(token_error)
+            manifest.update(failure_update)
+            self._write_json(run_dir / "manifest.json", manifest)
             raise
 
     def run_background(self, run_id: str) -> Dict[str, Any]:
@@ -1108,7 +1155,7 @@ The probabilities must be numbers in [0, 1] and sum to 1.
             if not pre_ready:
                 manifest["current_phase"] = "pre_social_prediction"
             elif state is not None and state.runner_status == RunnerStatus.INTERACTIVE_READY:
-                manifest["current_phase"] = "post_social_prediction"
+                manifest["current_phase"] = "finalizing_last_round_snapshot"
             else:
                 manifest["current_phase"] = "social_interaction"
             if state is not None:
@@ -1198,10 +1245,15 @@ The probabilities must be numbers in [0, 1] and sum to 1.
 
     def get_csv_path(self, run_id: str, kind: str) -> Path:
         if kind not in {
-            "predictions", "evaluation", "agent_changes", "round_metrics"
+            "predictions",
+            "evaluation",
+            "agent_changes",
+            "round_metrics",
+            "agent_token_usage",
         }:
             raise ValueError(
-                "kind must be predictions, evaluation, agent_changes, or round_metrics"
+                "kind must be predictions, evaluation, agent_changes, "
+                "round_metrics, or agent_token_usage"
             )
         path = self._run_dir(run_id) / f"{kind}.csv"
         if not path.exists():
@@ -1423,6 +1475,9 @@ The probabilities must be numbers in [0, 1] and sum to 1.
                 forecast = {
                     "scenario_id": manifest.get("scenario_id"),
                     "agent_id": agent_id,
+                    "full_population_agent_id": profile.get(
+                        "full_population_agent_id"
+                    ),
                     "agent_role": profile.get("role_id", "investor"),
                     "agent_role_category": profile.get("role_category", ""),
                     "agent_role_label": profile.get("role_label", ""),
@@ -1432,6 +1487,12 @@ The probabilities must be numbers in [0, 1] and sum to 1.
                     "error": "pre-social prediction is missing",
                     "evidence_event_ids": [],
                 }
+            else:
+                forecast = dict(forecast)
+                forecast.setdefault(
+                    "full_population_agent_id",
+                    profile.get("full_population_agent_id"),
+                )
             rows.append(
                 self._snapshot_record_from_forecast(
                     forecast,
@@ -1483,6 +1544,9 @@ The probabilities must be numbers in [0, 1] and sum to 1.
                     forecast = {
                         "scenario_id": scenario.scenario_id,
                         "agent_id": agent_id,
+                        "full_population_agent_id": profile.get(
+                            "full_population_agent_id"
+                        ),
                         "agent_role": profile.get("role_id", "investor"),
                         "agent_role_category": profile.get("role_category", ""),
                         "agent_role_label": profile.get("role_label", ""),
@@ -1504,6 +1568,65 @@ The probabilities must be numbers in [0, 1] and sum to 1.
                     )
                 )
         return rows
+
+    @staticmethod
+    def _post_predictions_from_final_snapshot(
+        run_dir: Path,
+        manifest: Dict[str, Any],
+        profiles: Sequence[Dict[str, Any]],
+        belief_snapshots: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Use the final private snapshot as post-social without another LLM call."""
+        final_round = int(manifest["social_rounds"])
+        final_by_agent = {
+            int(item["agent_id"]): item
+            for item in belief_snapshots
+            if int(item.get("round", -1)) == final_round
+        }
+        social_counts = S1ExperimentService._social_counts(run_dir)
+        records: List[Dict[str, Any]] = []
+        for profile in profiles:
+            agent_id = int(profile["user_id"])
+            snapshot = final_by_agent.get(agent_id)
+            if snapshot is None:
+                record = {
+                    **S1ExperimentService._run_metadata(manifest),
+                    "scenario_id": manifest.get("scenario_id"),
+                    "agent_id": agent_id,
+                    "full_population_agent_id": profile.get(
+                        "full_population_agent_id"
+                    ),
+                    "agent_role": profile.get("role_id", "investor"),
+                    "agent_role_category": profile.get("role_category", ""),
+                    "agent_role_label": profile.get("role_label", ""),
+                    "status": "missing",
+                    "error": "final-round belief snapshot is missing",
+                    "evidence_event_ids": [],
+                }
+            else:
+                record = dict(snapshot)
+                for snapshot_only_field in (
+                    "round",
+                    "snapshot_type",
+                    "snapshot_source",
+                ):
+                    record.pop(snapshot_only_field, None)
+            counts = social_counts.get(agent_id, {})
+            record.update(
+                {
+                    "condition": "S1_POST_SOCIAL",
+                    "prediction_stage": "post_social",
+                    "prediction_source": "final_round_belief_snapshot",
+                    "measurement_round": final_round,
+                    "social_action_count": counts.get("total", 0),
+                    "social_post_count": counts.get("post", 0),
+                    "social_comment_count": counts.get("comment", 0),
+                    "social_like_count": counts.get("like", 0),
+                    "social_dislike_count": counts.get("dislike", 0),
+                }
+            )
+            records.append(record)
+        return records
 
     def _build_exposure_edges(
         self,
@@ -2023,6 +2146,9 @@ The probabilities must be numbers in [0, 1] and sum to 1.
                     },
                     "scenario_id": before.get("scenario_id") or after.get("scenario_id"),
                     "agent_id": agent_id,
+                    "full_population_agent_id": metadata_source.get(
+                        "full_population_agent_id"
+                    ),
                     "agent_role_label": before.get("agent_role_label") or after.get("agent_role_label"),
                     "pre_direction": before.get("direction"),
                     "post_direction": after.get("direction"),
@@ -2197,7 +2323,7 @@ The probabilities must be numbers in [0, 1] and sum to 1.
                 "pre_social_prediction",
                 "social_interaction",
                 "round_belief_snapshots",
-                "post_social_prediction",
+                "final_round_snapshot_as_post_social",
             ],
             "social_rounds": manifest["social_rounds"],
             "pre_social": pre_metrics,

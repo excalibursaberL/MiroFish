@@ -8,7 +8,13 @@ from .c0 import C0ExperimentService
 from .background import C0BackgroundRunner
 from .dataset import FinancialDatasetLoader, FinancialScenario
 from .evaluator import FinancialOutcomeEvaluator
-from .roles import C0_AGENT_COUNT, build_c0_profiles
+from .roles import (
+    C0_AGENT_COUNT,
+    FULL_AGENT_COUNT,
+    SELECTED_AGENT_IDS,
+    build_c0_profiles,
+    build_full_c0_profiles,
+)
 from .s1 import S1ExperimentService
 from .s1_batch import S1BatchRunner
 from .stance_annotator import OfflineStanceAnnotator, StanceAnnotationError
@@ -20,7 +26,10 @@ __all__ = [
     "FinancialScenario",
     "FinancialOutcomeEvaluator",
     "C0_AGENT_COUNT",
+    "FULL_AGENT_COUNT",
+    "SELECTED_AGENT_IDS",
     "build_c0_profiles",
+    "build_full_c0_profiles",
     "S1ExperimentService",
     "S1BatchRunner",
     "OfflineStanceAnnotator",

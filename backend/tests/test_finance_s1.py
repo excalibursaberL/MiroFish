@@ -1,6 +1,9 @@
+import asyncio
 import json
+import random
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +13,66 @@ from app.finance.source_resolver import FinanceEventSourceResolver
 from app.finance.dataset import FinancialScenario
 from app.services.simulation_manager import SimulationManager
 from app.services.zep_entity_reader import EntityNode
+from scripts.run_reddit_simulation import (
+    AgentTokenUsageRecorder,
+    RedditSimulationRunner,
+)
+
+
+def test_s1_records_provider_tokens_for_one_agent(tmp_path):
+    class FakeAgent:
+        def __init__(self):
+            self.model_backend = SimpleNamespace(model_type="fallback-model")
+
+        async def _aget_model_response(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                usage_dict={
+                    "prompt_tokens": 321,
+                    "completion_tokens": 45,
+                    "total_tokens": 366,
+                },
+                response=SimpleNamespace(model="deepseek-v4-flash"),
+            )
+
+    class FakeAgentGraph:
+        def __init__(self, agent):
+            self.agent = agent
+
+        def get_agents(self):
+            return [(0, self.agent)]
+
+    agent = FakeAgent()
+    recorder = AgentTokenUsageRecorder(
+        str(tmp_path),
+        [
+            {
+                "agent_id": 0,
+                "full_population_agent_id": 1,
+                "agent_class": "investor",
+            }
+        ],
+    )
+    recorder.set_context("social_interaction", 2)
+    recorder.instrument(FakeAgentGraph(agent))
+    recorder.instrument(FakeAgentGraph(agent))
+
+    asyncio.run(agent._aget_model_response())
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "llm_token_usage.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert len(records) == 1
+    assert records[0]["agent_id"] == 0
+    assert records[0]["full_population_agent_id"] == 1
+    assert records[0]["phase"] == "social_interaction"
+    assert records[0]["round"] == 2
+    assert records[0]["model"] == "deepseek-v4-flash"
+    assert records[0]["prompt_tokens"] == 321
+    assert records[0]["completion_tokens"] == 45
+    assert records[0]["total_tokens"] == 366
 
 
 def test_s1_reddit_prepare_uses_scenario_attributed_publishers_and_safe_events(
@@ -23,10 +86,10 @@ def test_s1_reddit_prepare_uses_scenario_attributed_publishers_and_safe_events(
 
     assert manifest["status"] == "prepared"
     assert manifest["platform"] == "reddit"
-    assert manifest["investor_agent_count"] == 20
+    assert manifest["investor_agent_count"] == 10
     assert manifest["source_mode"] == "scenario"
     assert manifest["source_agent_count"] == 1
-    assert manifest["agent_count_total"] == 21
+    assert manifest["agent_count_total"] == 11
     assert manifest["graph_entity_count"] == 0
     assert manifest["graph_resolved_event_count"] == 0
     assert manifest["public_feed_event_count"] == 0
@@ -36,10 +99,14 @@ def test_s1_reddit_prepare_uses_scenario_attributed_publishers_and_safe_events(
     assert manifest["total_rounds"] == 6
     assert manifest["history_memory_event_count"] == 5
     assert manifest["current_public_event_count"] == 1
-    assert manifest["expected_prediction_count"] == 40
+    assert manifest["expected_prediction_count"] == 20
+    assert manifest["random_seed"] == 4004
     assert manifest["replicate_id"] == manifest["run_id"]
-    assert manifest["agent_set_version"] == "n20_full"
-    assert manifest["sampling_method"] == "full"
+    assert manifest["agent_set_version"] == "n10_k10_exact_v1"
+    assert manifest["sampling_method"] == "offline_exact_enumeration_k10"
+    assert manifest["selected_full_population_agent_ids"] == [
+        1, 3, 4, 5, 9, 11, 12, 13, 14, 17
+    ]
     assert len(manifest["input_snapshot_hash"]) == 64
     assert len(manifest["prompt_hash"]) == 64
     assert manifest["files"]["agent_round_states"] == "agent_round_states.jsonl"
@@ -54,12 +121,15 @@ def test_s1_reddit_prepare_uses_scenario_attributed_publishers_and_safe_events(
     ]
     current = json.loads((run_dir / "current_event.json").read_text(encoding="utf-8"))
 
-    assert [profile["user_id"] for profile in investors] == list(range(20))
+    assert [profile["user_id"] for profile in investors] == list(range(10))
+    assert [profile["full_population_agent_id"] for profile in investors] == [
+        1, 3, 4, 5, 9, 11, 12, 13, 14, 17
+    ]
     assert all(profile["agent_class"] == "investor" for profile in investors)
     assert all("S1 社会互动实验" in profile["persona"] for profile in investors)
     assert all("只读历史记忆" in profile["persona"] for profile in investors)
     assert all(history[0]["event_id"] in profile["persona"] for profile in investors)
-    assert [profile["user_id"] for profile in sources] == [20]
+    assert [profile["user_id"] for profile in sources] == [10]
     assert all(profile["agent_class"] == "source" for profile in sources)
     assert sources[0]["name"] == "COMPANY_004"
     assert sources[0]["source_type"] == "company"
@@ -68,7 +138,7 @@ def test_s1_reddit_prepare_uses_scenario_attributed_publishers_and_safe_events(
     assert all("publisher_agent_id" not in event for event in history)
     assert current["phase"] == "current"
     assert current["round"] == 0
-    assert current["publisher_agent_id"] == 20
+    assert current["publisher_agent_id"] == 10
     assert current["publisher_name"] == "COMPANY_004"
 
     mapping = json.loads(
@@ -88,13 +158,15 @@ def test_s1_reddit_prepare_uses_scenario_attributed_publishers_and_safe_events(
             / "simulation_config.json"
         ).read_text(encoding="utf-8")
     )
-    assert len(sim_config["agent_configs"]) == 21
-    assert sim_config["finance_s1"]["tracked_agent_ids"] == list(range(20))
-    assert sim_config["finance_s1"]["source_agent_ids"] == [20]
+    assert len(sim_config["agent_configs"]) == 11
+    assert sim_config["finance_s1"]["tracked_agent_ids"] == list(range(10))
+    assert sim_config["random_seed"] == 4004
+    assert sim_config["finance_s1"]["random_seed"] == 4004
+    assert sim_config["finance_s1"]["source_agent_ids"] == [10]
     assert sim_config["finance_s1"]["source_mode"] == "scenario"
     assert "event_schedule" not in sim_config["finance_s1"]
     assert "social_start_round" not in sim_config["finance_s1"]
-    assert len(sim_config["finance_s1"]["pre_social_interviews"]) == 20
+    assert len(sim_config["finance_s1"]["pre_social_interviews"]) == 10
     assert len(sim_config["event_config"]["initial_posts"]) == 1
     assert sim_config["event_config"]["initial_posts"][0]["finance_event"]["phase"] == "current"
     reddit_profiles = json.loads(
@@ -102,8 +174,8 @@ def test_s1_reddit_prepare_uses_scenario_attributed_publishers_and_safe_events(
             encoding="utf-8"
         )
     )
-    assert len(reddit_profiles) == 21
-    assert [profile["user_id"] for profile in reddit_profiles] == list(range(21))
+    assert len(reddit_profiles) == 11
+    assert [profile["user_id"] for profile in reddit_profiles] == list(range(11))
     assert all(
         {"persona", "mbti", "gender", "age", "country"} <= set(profile)
         for profile in reddit_profiles
@@ -158,14 +230,14 @@ def test_s1_graph_mode_reuses_zep_entities_for_dynamic_source_profiles(
     assert manifest["source_agent_count"] == 2
     run_dir = tmp_path / "finance" / manifest["run_id"]
     sources = json.loads((run_dir / "source_profiles.json").read_text(encoding="utf-8"))
-    assert [profile["user_id"] for profile in sources] == [20, 21]
+    assert [profile["user_id"] for profile in sources] == [10, 11]
     assert {profile["source_entity_uuid"] for profile in sources} == {
         "zep-company-003",
         "zep-media-b",
     }
     assert {profile["source_origin"] for profile in sources} == {"zep_graph"}
     current = json.loads((run_dir / "current_event.json").read_text(encoding="utf-8"))
-    assert current["publisher_agent_id"] in {20, 21}
+    assert current["publisher_agent_id"] in {10, 11}
     # Date-bearing media identifiers are preserved during parsing.  The
     # fixture intentionally uses a generic media alias, so the resolver uses
     # its auditable substring match instead of pretending it was an exact ID.
@@ -200,6 +272,13 @@ def test_s1_rounds_are_configurable_and_bounded(monkeypatch, tmp_path):
 
     with pytest.raises(ValueError, match="between 1 and 12"):
         service.prepare(scenario_id="SCN_009", source_mode="scenario", social_rounds=13)
+
+    with pytest.raises(ValueError, match="random_seed must be an integer"):
+        service.prepare(
+            scenario_id="SCN_009",
+            source_mode="scenario",
+            random_seed=True,
+        )
 
 
 def test_s1_prepared_settings_update_both_config_copies(monkeypatch, tmp_path):
@@ -526,8 +605,47 @@ def test_s1_forecast_prompt_defines_social_boundary_and_neutral_band(tmp_path):
         FinancialDatasetLoader().load(scenario_ids=["SCN_001"])[0],
         stage="pre_social",
     )
-    assert "还没有看到其他投资者的观点" in pre_prompt
-    assert "社会互动开始前" in pre_prompt
+    snapshot_prompt = service.build_belief_snapshot_prompt(
+        FinancialDatasetLoader().load(scenario_ids=["SCN_001"])[0]
+    )
+    assert pre_prompt == snapshot_prompt
+    assert "私有信念测量" in pre_prompt
+    assert "此刻在模拟中实际可见的信息" in pre_prompt
+    assert "社会互动开始前" not in pre_prompt
+    assert "interaction round" not in pre_prompt
+
+
+def test_s1_prepare_uses_identical_pre_and_round_belief_prompts(
+    monkeypatch, tmp_path
+):
+    simulation_dir = tmp_path / "simulations"
+    monkeypatch.setattr(SimulationManager, "SIMULATION_DATA_DIR", str(simulation_dir))
+    service = S1ExperimentService(storage_dir=tmp_path / "finance")
+    manifest = service.prepare(
+        scenario_id="SCN_001",
+        source_mode="scenario",
+        social_rounds=2,
+    )
+    config = json.loads(
+        (
+            simulation_dir
+            / manifest["simulation_id"]
+            / "simulation_config.json"
+        ).read_text(encoding="utf-8")
+    )
+    pre = config["finance_s1"]["pre_social_interviews"]
+    snapshots = config["finance_s1"]["round_belief_snapshot_interviews"]
+
+    assert {item["prompt"] for item in pre} == {
+        item["prompt"] for item in snapshots
+    }
+    assert {item["retry_prompt"] for item in pre} == {
+        item["retry_prompt"] for item in snapshots
+    }
+    assert "__ROUND_NUMBER__" not in pre[0]["prompt"]
+    assert config["finance_s1"]["prompt_version"] == (
+        "finance_forecast_s1_v3_unified_belief"
+    )
 
 
 def test_s1_prediction_changes_and_group_metrics_are_paired_by_agent(tmp_path):
@@ -603,6 +721,7 @@ def test_s1_batch_uses_only_completed_graph_manifest_entries(tmp_path):
     )
 
     assert manifest["status"] == "prepared"
+    assert manifest["random_seed"] == 4004
     assert manifest["scenario_count"] == 1
     assert manifest["runs"][0]["scenario_id"] == "SCN_008"
     assert manifest["runs"][0]["graph_id"] == "mirofish_graph_test"
@@ -753,12 +872,73 @@ def test_s1_round_belief_snapshots_keep_round_alignment_and_missing_rows(
         run_dir, manifest, loaded_scenario, profiles, pre
     )
 
-    assert len(snapshots) == 20 * 3
+    assert len(snapshots) == 10 * 3
     assert {item["round"] for item in snapshots} == {0, 1, 2}
-    assert sum(item["status"] == "ok" for item in snapshots if item["round"] == 0) == 20
-    assert sum(item["status"] == "ok" for item in snapshots if item["round"] == 1) == 20
-    assert sum(item["status"] == "missing" for item in snapshots if item["round"] == 2) == 20
+    assert sum(item["status"] == "ok" for item in snapshots if item["round"] == 0) == 10
+    assert sum(item["status"] == "ok" for item in snapshots if item["round"] == 1) == 10
+    assert sum(item["status"] == "missing" for item in snapshots if item["round"] == 2) == 10
+    assert {item["full_population_agent_id"] for item in snapshots} == {
+        1, 3, 4, 5, 9, 11, 12, 13, 14, 17
+    }
     assert all(item["snapshot_source"] == "private_round_interview" for item in snapshots if item["round"] == 1)
+
+    post = service._post_predictions_from_final_snapshot(
+        run_dir, manifest, profiles, snapshots
+    )
+    assert len(post) == 10
+    assert all(item["prediction_stage"] == "post_social" for item in post)
+    assert all(
+        item["prediction_source"] == "final_round_belief_snapshot"
+        for item in post
+    )
+    assert all(item["measurement_round"] == 2 for item in post)
+    assert all(item["status"] == "missing" for item in post)
+
+
+def test_reddit_runner_applies_and_audits_local_random_seed(tmp_path):
+    config_path = tmp_path / "simulation_config.json"
+    config_path.write_text(
+        json.dumps({"random_seed": 12345, "agent_configs": []}),
+        encoding="utf-8",
+    )
+
+    runner = RedditSimulationRunner(str(config_path), wait_for_commands=False)
+    first_value = random.random()
+    runner._apply_random_seed(12345)
+
+    assert random.random() == first_value
+    state = json.loads(
+        (tmp_path / "random_seed_state.json").read_text(encoding="utf-8")
+    )
+    assert state["random_seed"] == 12345
+    assert state["python_random_seeded"] is True
+    assert state["numpy_seeded"] is True
+    assert state["llm_provider_seeded"] is False
+
+
+def test_reddit_finance_forecast_precheck_rejects_zero_sum_probabilities():
+    assert RedditSimulationRunner._is_valid_finance_forecast_response(
+        {
+            "response": json.dumps(
+                {
+                    "up_probability": 0.0,
+                    "neutral_probability": 0.0,
+                    "down_probability": 0.0,
+                }
+            )
+        }
+    ) is False
+    assert RedditSimulationRunner._is_valid_finance_forecast_response(
+        {
+            "response": json.dumps(
+                {
+                    "up_probability": 0.2,
+                    "neutral_probability": 0.3,
+                    "down_probability": 0.5,
+                }
+            )
+        }
+    ) is True
 
 
 def test_s1_exposure_edges_preserve_content_and_auditable_stance(tmp_path):

@@ -7,10 +7,10 @@
 `C0` 具备以下能力：
 
 - 支持单场景模式，以及一次运行全部 18 个匿名场景的批量模式；
-- 20 个匿名投资者 Agent；
-- 3 个机构投资者、6 个有经验散户、8 个具备基础知识的散户、3 个新手散户；
-- 17 个散户的风险态度按 `3/10/3/1`、投资期限按 `9/6/2` 分配；
-- 散户分析方式使用 TwinMarket 的技术面/基本面类别作为实验先验，按 `10/7` 分配；
+- 从完整 20 人画像池中固定筛选出的 10 个匿名投资者 Agent；
+- 当前子集由 1 个机构投资者、3 个有经验散户、5 个具备基础知识的散户、1 个新手散户组成；
+- 原始 ID 固定为 `1, 3, 4, 5, 9, 11, 12, 13, 14, 17`，运行时连续重编号为 `0–9`；
+- 完整画像池仍按调查配额与 TwinMarket 实验先验生成，便于审计降采样来源；
 - 每个 Agent 读取同一场景的 5 个历史种子和 1 个当前公开事件；
 - 每个 Agent 单独调用一次模型；
 - 模型返回空文本、截断文本或无效 JSON 时自动重试一次，并记录 `attempt_count`；
@@ -19,7 +19,7 @@
 - C0 固定使用每个场景的 5 条历史种子；
 - `stock_factors` 保留在数据集和冻结快照中，但不写入 LLM Prompt；
 - 输出方向、三分类概率、预期收益、置信度、证据事件 ID 和理由。
-- 批量模式会在后台依次完成 `18 × 20 = 360` 次模型调用，并持续写入 CSV。
+- 批量模式会在后台依次完成 `18 × 10 = 180` 次模型调用，并持续写入 CSV。
 - 五日方向采用固定的 `±1.7%` 中性区间：`R5 < -1.7%` 为下跌，`|R5| <= 1.7%` 为中性，`R5 > 1.7%` 为上涨。
 
 `C0` 不创建 OASIS 社交环境，也不写入 Zep 社会互动记录，用来提供没有社会互动的基线。`S1` 复用同一组 Profile 和匿名场景，再将 Agent 接入帖子、评论和点赞链路。
@@ -54,7 +54,7 @@ Dataset/seed5_small_blind/mirofish_inputs.jsonl
 http://localhost:3000/finance/c0
 ```
 
-页面会依次完成运行范围选择、输入冻结、Prompt dry-run、Agent 正式运行和结果展示。选择“全部场景”后，正式运行按钮会一键启动 18 个场景、360 次预测。首页右上角也提供了“A股 C0 实验”入口。
+页面会依次完成运行范围选择、输入冻结、Prompt dry-run、Agent 正式运行和结果展示。选择“全部场景”后，正式运行按钮会一键启动 18 个场景、180 次预测。首页右上角也提供了“A股 C0 实验”入口。
 
 获取可选的匿名场景：
 
@@ -89,13 +89,16 @@ MiroFish/backend/uploads/finance/<run_id>/
 主要文件：
 
 - `manifest.json`：运行组别、数据集和文件状态；
-- `profiles.json`：20 个 OASIS 兼容 Profile；
+- `profiles.json`：10 个 OASIS 兼容 Profile；`user_id` 是 `0–9` 的运行时 ID，`full_population_agent_id` 是其在原 20 人池中的 ID；
 - `scenarios.jsonl`：冻结后的安全输入快照；
 - `prompts.jsonl`：每个场景/Agent 的独立 Prompt；
 - `predictions.jsonl`：真实运行后的结构化预测。
 - `predictions.csv`：逐 Agent 预测，不包含真实答案；同时记录知识水平、分析方式、风险态度、投资期限和画像版本，运行中每完成一个 Agent 就会刷新；
 - `evaluation.csv`：预测与隐藏真实结果的连接表，只在全部 Agent 完成后生成，供研究者统计准确率和收益误差；
-- `llm_responses.jsonl`：每次实际 API 尝试的完整请求和响应，包括重试、响应 ID、choices、content、reasoning_content、finish_reason、usage 和异常信息，不包含 API Key。
+- `llm_responses.jsonl`：每次实际 API 尝试的完整请求和响应，包括重试、响应 ID、choices、content、reasoning_content、finish_reason、usage 和异常信息，不包含 API Key；
+- `llm_token_usage.jsonl`：每次模型调用由供应商返回的原始 token 用量；
+- `agent_token_usage.csv`：逐 Agent 汇总的输入、输出、总 token 与分阶段用量；
+- `token_usage_summary.json`：整次实验及各阶段的 token 汇总。缺失的供应商 usage 会明确计数，不使用文本长度估算。
 
 `llm_responses.jsonl` 用于研究者排查供应商响应问题，其中可能包含完整 Prompt 和模型返回内容，不应提供给 Agent，也不应公开发布。
 
@@ -128,7 +131,7 @@ POST /api/finance/c0/run
 }
 ```
 
-批量运行期间可以关闭前端页面。后端进程停止或重启时，正在执行的任务会先显示为“中断”；重新打开页面后可点击“继续剩余预测”，已经写入 `predictions.jsonl` 的结果不会重复调用。360 次调用的时间与费用取决于所选模型；正式启动前应先核对模型价格、API 额度和 Prompt dry-run。
+批量运行期间可以关闭前端页面。后端进程停止或重启时，正在执行的任务会先显示为“中断”；重新打开页面后可点击“继续剩余预测”，已经写入 `predictions.jsonl` 的结果不会重复调用。180 次调用的时间与费用取决于所选模型；正式启动前应先核对模型价格、API 额度和 Prompt dry-run。
 
 查询状态：
 
@@ -164,11 +167,13 @@ GET /api/finance/c0/<run_id>/outcome
 
 ## S1：Reddit 社会互动原型
 
-S1 固定运行一个匿名场景，包含 20 个参与预测的投资者 Agent，以及从当前场景动态解析出的信息发布账号。OASIS Reddit 会按 Profile 列表位置分配 Agent ID，因此投资者固定为 `0–19`；信息主体根据事件中实际出现的发布者从 `20` 开始连续编号，数量不再固定。
+S1 固定运行一个匿名场景，包含同一组 10 个参与预测的投资者 Agent，以及从当前场景动态解析出的信息发布账号。OASIS Reddit 会按 Profile 列表位置分配 Agent ID，因此投资者固定为 `0–9`；信息主体根据事件中实际出现的发布者从 `10` 开始连续编号，数量不再固定。
 
-一次实验执行固定顺序：`历史记忆预载 -> 当前事件公开 -> pre-social 预测 -> 社会互动 -> post-social 预测 -> 配对比较`。5 条历史种子直接写入每个投资者的只读 Profile 记忆，不再作为帖子逐轮发布，也不占互动轮数；只有当前事件由图谱解析出的信息主体发布为初始公开帖。默认社会互动为 6 轮，可在 `1–12` 轮之间设置。每轮只表示一次互动机会，不映射成现实中的分钟或交易日。这里的“五日”仅指预测目标是未来 5 个交易日累计收盘收益。
+一次实验执行固定顺序：`历史记忆预载 -> 当前事件公开 -> pre-social 信念测量 -> 每轮社会互动及信念快照 -> 最后一轮快照作为 post-social -> 配对比较`。5 条历史种子直接写入每个投资者的只读 Profile 记忆，不再作为帖子逐轮发布，也不占互动轮数；只有当前事件由图谱解析出的信息主体发布为初始公开帖。默认社会互动为 6 轮，可在 `1–12` 轮之间设置。每轮只表示一次互动机会，不映射成现实中的分钟或交易日。这里的“五日”仅指预测目标是未来 5 个交易日累计收盘收益。
 
-pre-social 和 post-social 都采访同一套 OASIS Agent。第一次采访在当前事件发布后、任何投资者行动前完成；第二次采访在全部互动结束后完成。pre-social 无效 JSON 会在互动开始前重试一次，post-social 则只重试失败 Agent。两阶段的差异因此可以解释为社会信息暴露后的观点变化，而不是 Profile、事件输入或 Agent 实例变化。评测真值仍然只在全部预测完成后读取。
+pre-social 和每轮快照都对同一套 OASIS Agent 使用逐字相同、阶段中性的私有测量提示词；轮次只写入实验元数据，不进入提示词。每次测量的无效 JSON 会立即重试一次。最后一轮快照直接派生 `post_social_predictions.jsonl`，不会再发起语义重复的 post-social LLM 采访。评测真值仍然只在全部预测完成后读取。
+
+`random_seed` 默认固定为 `4004`。启动 OASIS 子进程前设置 `PYTHONHASHSEED`，子进程内固定 Python、NumPy 和 PyTorch 随机源，并把实际状态写入 `random_seed_state.json`。这可以固定本地 Agent 激活、推荐抽样和调度随机性；DeepSeek API 没有可依赖的确定性 seed 合约，因此相同输入的模型文本仍可能出现小幅差异，不能声称端到端逐 token 可复现。
 
 正式实验推荐传入已经由 MiroFish 种子材料流程建好的 `project_id` 或 `graph_id`。S1 会复用 `ZepEntityReader` 读取图谱实体，把事件中的发布者匹配到实体 UUID，再生成受系统控制、不参与预测的信息账号。同一实体发布多条事件时只生成一个账号；事件中被提及但没有直接发布信息的实体只进入映射记录，不会自动成为发布者。图谱模式下，只要文本能够识别出发布者但图谱里找不到对应实体，准备阶段就会直接报错，避免悄悄退回虚构账号后仍被误认为正式实验。
 
@@ -246,13 +251,17 @@ GET /api/finance/s1/reddit/batch/<batch_id>
 - `current_event.json`：作为 Reddit 初始公开帖发布的当前事件及其图谱信息源；
 - `entity_agent_mapping.json`：图谱实体、动态 Agent ID、事件发布者和被提及实体之间的可审计映射；
 - `social_actions.jsonl`：从 OASIS `trace` 表导出的完整互动动作，包含推断轮次、Agent、动作类型和完整参数；
-- `interview_responses.json`：pre/post 两阶段采访的完整响应及重试；
+- `interview_responses.json`：pre-social 采访响应，以及 post-social 从最后快照派生且未额外调用 LLM 的审计记录；
 - `pre_social_predictions.jsonl`、`post_social_predictions.jsonl`：两阶段结构化预测；
 - `predictions.jsonl`：post-social 兼容副本；`predictions.csv` 同时包含两个阶段；
 - `prediction_changes.jsonl`、`agent_changes.csv`：逐 Agent 的改判、概率分布 JS、预期收益和置信度变化；
 - `social_metrics.json`：方向分布、平均概率、群体熵、共识率、极化程度、改判率和各项 pre/post 变化；
 - `round_metrics.csv`：逐轮动作数、活跃 Agent 数、发帖、评论、点赞、点踩和刷新数；
-- `evaluation.csv`：两阶段预测与隐藏五日真实结果的连接表。
+- `evaluation.csv`：两阶段预测与隐藏五日真实结果的连接表；
+- `llm_token_usage.jsonl`：OASIS/CAMEL 每次模型调用的供应商 token 用量、Agent、阶段和轮次；
+- `agent_token_usage.csv`：逐投资者 Agent 汇总，并分别统计 pre-social、社会互动、逐轮信念快照和 post-social 用量；
+- `token_usage_summary.json`：本场景的总体及分阶段 token 汇总。
+- `random_seed_state.json`：本地随机源实际应用状态，以及 DeepSeek 服务端非确定性的说明。
 
 对应 OASIS 数据库位于 `backend/uploads/simulations/<simulation_id>/reddit_simulation.db`，其中 `trace` 表可用于统计真实发帖、评论、点赞、搜索和采访动作。
 

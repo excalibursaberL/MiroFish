@@ -100,6 +100,14 @@ class S1BatchRunner:
                 f"social_rounds must be between {S1ExperimentService.MIN_SOCIAL_ROUNDS} "
                 f"and {S1ExperimentService.MAX_SOCIAL_ROUNDS}"
             )
+        if random_seed is None:
+            random_seed = S1ExperimentService.DEFAULT_RANDOM_SEED
+        if (
+            isinstance(random_seed, bool)
+            or not isinstance(random_seed, int)
+            or not 0 <= random_seed <= 0xFFFFFFFF
+        ):
+            raise ValueError("random_seed must be an integer between 0 and 4294967295")
         graph_manifest = Path(
             graph_manifest_path or self.DEFAULT_GRAPH_MANIFEST
         ).resolve()
@@ -281,7 +289,10 @@ class S1BatchRunner:
                             f"{manifest.get('replicate_id') or batch_id}:{scenario_id}"
                         ),
                         agent_set_version=manifest.get("agent_set_version"),
-                        sampling_method=manifest.get("sampling_method", "full"),
+                        sampling_method=manifest.get(
+                            "sampling_method",
+                            S1ExperimentService.DEFAULT_SAMPLING_METHOD,
+                        ),
                         random_seed=manifest.get("random_seed"),
                     )
                     item.update(
