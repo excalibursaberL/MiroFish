@@ -241,6 +241,18 @@ def get_s1_reddit_exposure_edges(run_id: str):
         return jsonify({"success": False, "error": str(error)}), 404
 
 
+@finance_bp.route("/s1/reddit/<run_id>/interaction-edges", methods=["GET"])
+def get_s1_reddit_interaction_edges(run_id: str):
+    """Return explicit directed interactions, separate from feed visibility."""
+    try:
+        return jsonify({
+            "success": True,
+            "data": _s1_service().get_interaction_edges(run_id),
+        })
+    except (FileNotFoundError, ValueError) as error:
+        return jsonify({"success": False, "error": str(error)}), 404
+
+
 @finance_bp.route("/s1/reddit/<run_id>/stance-annotate", methods=["POST"])
 def annotate_s1_reddit_stances(run_id: str):
     """Annotate saved posts/comments after an S1 run using an independent LLM."""

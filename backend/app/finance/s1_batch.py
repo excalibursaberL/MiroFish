@@ -263,6 +263,25 @@ class S1BatchRunner:
             thread.start()
         return manifest
 
+    def run_sync(self, batch_id: str) -> Dict[str, Any]:
+        """Run a prepared batch in the current process and return its status.
+
+        CLI research jobs must keep the worker alive until every scenario has
+        finished. The API-facing ``start`` method intentionally uses a daemon
+        thread owned by the backend process, while this method provides the
+        corresponding blocking entry point for reproducible seed sweeps.
+        """
+        manifest = self.get_status(batch_id, reconcile=False)
+        if manifest.get("status") != "prepared":
+            raise ValueError("S1 batch must be prepared before it can run")
+        with self._lock:
+            if any(thread.is_alive() for thread in self._threads.values()):
+                raise ValueError("another S1 batch is already active")
+            manifest.update({"status": "queued", "updated_at": self._now()})
+            self._write_json(self._batch_dir(batch_id) / "manifest.json", manifest)
+        self._execute(batch_id)
+        return self.get_status(batch_id, reconcile=False)
+
     def _execute(self, batch_id: str) -> None:
         path = self._batch_dir(batch_id) / "manifest.json"
         manifest = self._read_json(path)

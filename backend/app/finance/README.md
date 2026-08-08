@@ -277,8 +277,49 @@ http://localhost:3000/finance/s1
 
 - `round_belief_interviews.jsonl`: raw private forecast interviews after each social round.
 - `belief_snapshots.jsonl`: parsed round `0..N` belief rows for every investor; missing interviews are retained as `status=missing`.
-- `exposure_edges.jsonl`: one row per observed feed exposure or direct interaction, with viewer, content, author, round, first-seen round, and stance annotation provenance.
+- `exposure_edges.jsonl`: compatibility audit rows for feed visibility and content actions. Use `edge_layer=exposure_opportunity` for content placed in an Agent's observable feed and `edge_layer=direct_interaction` for an explicit content action. Feed visibility does not prove attention or influence.
+- `interaction_edges.jsonl`: normalized directed likes, dislikes, comments, follows, and mutes. It preserves `interaction_kind` and `interaction_sign` (`+1`, `0`, or `-1`) separately from feed visibility.
+- `is_first_exposure` distinguishes the first round in which an Agent observed a content item from later repeated rounds. `is_self_authored` marks the Agent's own content; such rows remain auditable but are excluded from `exposure_social_*` statistics in v2 datasets.
 - Source-account posts are labeled `informational`; investor posts/comments use explicit metadata when supplied by OASIS, otherwise `lexicon_v1` is a transparent heuristic and must not be treated as human ground truth.
+
+The corresponding read APIs are:
+
+```text
+GET /api/finance/s1/reddit/<run_id>/exposure-edges
+GET /api/finance/s1/reddit/<run_id>/interaction-edges
+```
+
+For graph analysis, build an information-opportunity graph from feed rows and
+an influence-candidate graph from explicit interaction rows. Do not merge the
+two layers or describe either layer as causal influence without an identified
+intervention or temporal model.
+
+### 固定 K=10、6 轮的多随机种子重跑
+
+该脚本固定使用当前 10 个投资者 Agent、6 轮社会互动和已经构建完成的
+`SCN_001` 至 `SCN_018` 图谱。不同 seed 串行执行，不会同时启动多个
+OASIS 环境。建议先执行 dry-run；它只验证配置并打印计划，不创建批次，
+也不调用 LLM：
+
+```powershell
+cd MiroFish/backend
+.venv/Scripts/python.exe scripts/run_s1_seed_sweep.py --seeds 4005 4006 4007 --dry-run
+```
+
+确认后去掉 `--dry-run` 正式执行：
+
+```powershell
+.venv/Scripts/python.exe scripts/run_s1_seed_sweep.py --seeds 4005 4006 4007
+```
+
+每个 seed 会生成独立的 `backend/uploads/finance/s1_batch_*/`，同时生成一个
+`s1_seed_sweep_*/manifest.json` 记录 seed 与 batch ID 的对应关系和完成状态。
+单个 seed 中某个场景失败时，批处理仍会继续其余场景；默认不会继续下一个
+seed，传入 `--continue-on-error` 才会继续。脚本只固定本地 Python、NumPy、
+PyTorch 和 OASIS 随机源；DeepSeek 服务端不保证逐 token 确定性。
+
+该脚本不会自动执行离线内容立场标注。正式运行完成后，可针对总清单中的每个
+`s1_batch_*` 使用下一节的批次或单次标注脚本。
 
 ### Offline LLM stance annotation
 

@@ -229,11 +229,32 @@ class S1ExperimentService:
         "content_stance",
         "stance_score",
         "stance_source",
+        "edge_layer",
         "exposure_type",
         "action_type",
         "interacted",
+        "interaction_sign",
         "interaction_target_id",
         "first_seen_round",
+        "is_first_exposure",
+        "is_self_authored",
+    )
+    INTERACTION_FIELDS = (
+        *RUN_METADATA_FIELDS,
+        "scenario_id",
+        "interaction_id",
+        "trace_id",
+        "round",
+        "timestamp",
+        "actor_agent_id",
+        "actor_class",
+        "target_agent_id",
+        "target_class",
+        "action_type",
+        "interaction_kind",
+        "interaction_sign",
+        "content_type",
+        "content_id",
     )
 
     def __init__(
@@ -739,6 +760,7 @@ class S1ExperimentService:
                 "agent_round_states": "agent_round_states.jsonl",
                 "belief_snapshots": "belief_snapshots.jsonl",
                 "exposure_edges": "exposure_edges.jsonl",
+                "interaction_edges": "interaction_edges.jsonl",
                 "stance_annotations": "stance_annotations.jsonl",
                 "stance_annotations_csv": "stance_annotations.csv",
                 "social_actions_annotated": "social_actions_annotated.jsonl",
@@ -883,6 +905,9 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
             self._export_social_actions(run_dir)
             actions = self.get_actions(run_id)
             exposure_edges = self._build_exposure_edges(run_dir, manifest, actions)
+            self._build_interaction_edges(
+                run_dir, manifest, actions, exposure_edges
+            )
             self._write_jsonl(
                 run_dir / "agent_round_states.jsonl",
                 self._build_agent_round_states(run_dir, manifest, actions),
@@ -966,6 +991,7 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
                 {
                     "belief_snapshots": "belief_snapshots.jsonl",
                     "exposure_edges": "exposure_edges.jsonl",
+                    "interaction_edges": "interaction_edges.jsonl",
                 }
             )
             self._write_jsonl(
@@ -1319,6 +1345,16 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
             if line.strip()
         ]
 
+    def get_interaction_edges(self, run_id: str) -> List[Dict[str, Any]]:
+        path = self._run_dir(run_id) / "interaction_edges.jsonl"
+        if not path.exists():
+            return []
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
     @staticmethod
     def _read_json(path: Path) -> Dict[str, Any]:
         if not path.exists():
@@ -1634,7 +1670,14 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
         manifest: Dict[str, Any],
         actions: Sequence[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Normalize feed visibility and direct interactions into edge rows."""
+        """Record content visibility opportunities and content interactions.
+
+        ``feed_visible`` means that OASIS placed the content in the Agent's
+        observable feed payload.  It does not assert attention or influence.
+        Direct actions remain in this compatibility artifact, but are marked
+        as a separate layer and are also normalized into
+        ``interaction_edges.jsonl``.
+        """
         post_owners: Dict[Any, int] = {}
         comment_owners: Dict[Any, int] = {}
         content: Dict[tuple[str, Any], Dict[str, Any]] = {}
@@ -1726,6 +1769,14 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
             )
             trace_id = action.get("trace_id")
             exposure_id = f"{trace_id}:{content_type}:{content_id}"
+            action_type = str(action.get("action_type", "")).lower()
+            interaction_sign = {
+                "like_post": 1,
+                "like_comment": 1,
+                "dislike_post": -1,
+                "dislike_comment": -1,
+            }.get(action_type, 0 if interacted else None)
+            author_agent_id = metadata.get("author_agent_id")
             edges.append(
                 {
                     **self._run_metadata(manifest),
@@ -1737,16 +1788,23 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
                     "viewer_agent_id": int(action["agent_id"]),
                     "content_type": content_type,
                     "content_id": content_id,
-                    "author_agent_id": metadata.get("author_agent_id"),
+                    "author_agent_id": author_agent_id,
                     "content_text": metadata.get("content_text", ""),
                     "content_stance": metadata.get("content_stance", "unknown"),
                     "stance_score": metadata.get("stance_score"),
                     "stance_source": metadata.get("stance_source", "unlabeled"),
+                    "edge_layer": (
+                        "direct_interaction"
+                        if interacted else "exposure_opportunity"
+                    ),
                     "exposure_type": exposure_type,
                     "action_type": action.get("action_type"),
                     "interacted": bool(interacted),
+                    "interaction_sign": interaction_sign,
                     "interaction_target_id": interaction_target,
                     "first_seen_round": round_number,
+                    "is_first_exposure": True,
+                    "is_self_authored": author_agent_id == int(action["agent_id"]),
                 }
             )
 
@@ -1771,7 +1829,7 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
                                 False,
                             )
             action_type = str(action.get("action_type", "")).lower()
-            if action_type in {"like_post", "dislike_post", "create_comment"}:
+            if action_type in {"like_post", "dislike_post"}:
                 add_edge(
                     action,
                     "post",
@@ -1779,6 +1837,23 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
                     "direct_action",
                     True,
                 )
+            if action_type == "create_comment":
+                if action.get("target_comment_id") is not None:
+                    add_edge(
+                        action,
+                        "comment",
+                        action.get("target_comment_id"),
+                        "direct_action",
+                        True,
+                    )
+                else:
+                    add_edge(
+                        action,
+                        "post",
+                        action.get("target_post_id"),
+                        "direct_action",
+                        True,
+                    )
             if action_type in {"like_comment", "dislike_comment"}:
                 add_edge(
                     action,
@@ -1797,8 +1872,100 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
                 ),
                 edge["round"],
             )
+            edge["is_first_exposure"] = (
+                int(edge["first_seen_round"]) == int(edge["round"])
+            )
         self._write_jsonl(run_dir / "exposure_edges.jsonl", edges)
         return edges
+
+    def _build_interaction_edges(
+        self,
+        run_dir: Path,
+        manifest: Dict[str, Any],
+        actions: Sequence[Dict[str, Any]],
+        exposure_edges: Sequence[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Normalize explicit Agent actions separately from feed exposure."""
+        supported = {
+            "like_post": ("reaction", 1, "post", "target_post_id"),
+            "dislike_post": ("reaction", -1, "post", "target_post_id"),
+            "like_comment": ("reaction", 1, "comment", "target_comment_id"),
+            "dislike_comment": ("reaction", -1, "comment", "target_comment_id"),
+            "create_comment": ("comment", 0, None, None),
+            "follow": ("agent_relation", 1, "agent", None),
+            "mute": ("agent_relation", -1, "agent", None),
+        }
+        direct_targets: Dict[int, int] = {}
+        for edge in exposure_edges:
+            if edge.get("exposure_type") != "direct_action":
+                continue
+            trace_id = edge.get("trace_id")
+            author_id = edge.get("author_agent_id")
+            if isinstance(trace_id, int) and isinstance(author_id, int):
+                direct_targets.setdefault(trace_id, author_id)
+
+        records: List[Dict[str, Any]] = []
+        for action in actions:
+            action_type = str(action.get("action_type", "")).lower()
+            if action_type not in supported or action.get("agent_class") != "investor":
+                continue
+            kind, sign, content_type, content_key = supported[action_type]
+            args = action.get("action_args") or {}
+            target_agent_id = action.get("target_agent_id")
+            if target_agent_id is None:
+                target_agent_id = direct_targets.get(action.get("trace_id"))
+            if target_agent_id is None and action_type == "follow":
+                target_agent_id = args.get("follow_id")
+            if target_agent_id is None and action_type == "mute":
+                target_agent_id = args.get("mute_id")
+
+            content_id = action.get(content_key) if content_key else None
+            if action_type == "create_comment":
+                if action.get("target_comment_id") is not None:
+                    content_type = "comment"
+                    content_id = action.get("target_comment_id")
+                elif action.get("target_post_id") is not None:
+                    content_type = "post"
+                    content_id = action.get("target_post_id")
+                else:
+                    content_type = None
+
+            # A top-level comment has no observed target relation.  Keep it in
+            # social_actions.jsonl, but do not invent an interaction edge.
+            if target_agent_id is None:
+                continue
+            try:
+                target_agent_id = int(target_agent_id)
+            except (TypeError, ValueError):
+                continue
+            trace_id = action.get("trace_id")
+            records.append(
+                {
+                    **self._run_metadata(manifest),
+                    "scenario_id": manifest.get("scenario_id"),
+                    "interaction_id": (
+                        f"{trace_id}:{action_type}:{target_agent_id}:"
+                        f"{content_type or 'none'}:{content_id or 'none'}"
+                    ),
+                    "trace_id": trace_id,
+                    "round": int(action.get("round", 0) or 0),
+                    "timestamp": action.get("timestamp"),
+                    "actor_agent_id": int(action["agent_id"]),
+                    "actor_class": "investor",
+                    "target_agent_id": target_agent_id,
+                    "target_class": (
+                        "investor"
+                        if target_agent_id < self.SOURCE_AGENT_START else "source"
+                    ),
+                    "action_type": action_type,
+                    "interaction_kind": kind,
+                    "interaction_sign": sign,
+                    "content_type": content_type,
+                    "content_id": content_id,
+                }
+            )
+        self._write_jsonl(run_dir / "interaction_edges.jsonl", records)
+        return records
 
     @staticmethod
     def _social_counts(run_dir: Path) -> Dict[int, Dict[str, int]]:
@@ -1952,6 +2119,9 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
             return 0, "unattributed"
 
         records = []
+        db_post_owners: Dict[int, int] = {}
+        db_comment_owners: Dict[int, int] = {}
+        db_comment_posts: Dict[int, int] = {}
         with sqlite3.connect(db_path) as connection:
             rows = connection.execute(
                 """
@@ -1961,6 +2131,51 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
                 ORDER BY created_at, rowid
                 """
             ).fetchall()
+            table_names = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            user_to_agent: Dict[int, int] = {}
+            if "user" in table_names:
+                for user_id, mapped_agent_id in connection.execute(
+                    "SELECT user_id, agent_id FROM user"
+                ).fetchall():
+                    if user_id is None:
+                        continue
+                    user_to_agent[int(user_id)] = int(
+                        mapped_agent_id if mapped_agent_id is not None else user_id
+                    )
+            if "post" in table_names:
+                for stored_post_id, user_id in connection.execute(
+                    "SELECT post_id, user_id FROM post"
+                ).fetchall():
+                    if stored_post_id is None or user_id is None:
+                        continue
+                    db_post_owners[int(stored_post_id)] = user_to_agent.get(
+                        int(user_id), int(user_id)
+                    )
+            if "comment" in table_names:
+                for stored_comment_id, stored_post_id, user_id in connection.execute(
+                    "SELECT comment_id, post_id, user_id FROM comment"
+                ).fetchall():
+                    if stored_comment_id is None:
+                        continue
+                    normalized_comment_id = int(stored_comment_id)
+                    if stored_post_id is not None:
+                        db_comment_posts[normalized_comment_id] = int(stored_post_id)
+                    if user_id is not None:
+                        db_comment_owners[normalized_comment_id] = user_to_agent.get(
+                            int(user_id), int(user_id)
+                        )
+
+        def relation_lookup(mapping: Dict[int, int], value: Any) -> Optional[int]:
+            try:
+                return mapping.get(int(value))
+            except (TypeError, ValueError):
+                return None
+
         for trace_id, agent_id, created_at, action, info in rows:
             try:
                 action_args = json.loads(info) if info else {}
@@ -1988,6 +2203,11 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
                 target_comment_id = comment_id
             if action_type == "create_comment" and target_comment_id is None:
                 target_comment_id = optional_arg("parent_comment_id", "parent_id")
+            if action_type == "create_comment" and target_post_id is None:
+                # OASIS normally records only the newly-created comment ID in
+                # the trace.  The authoritative parent post relation lives in
+                # the Reddit database's comment table.
+                target_post_id = relation_lookup(db_comment_posts, comment_id)
             visible_posts = action_args.get("posts")
             if not isinstance(visible_posts, list):
                 visible_posts = []
@@ -2017,10 +2237,16 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
                 ),
                 "action_type": action_type,
                 "action_args": action_args,
-                # These are populated only when OASIS explicitly records them;
-                # an absent relation remains null instead of being inferred.
+                # Content targets may also be recovered from the authoritative
+                # Reddit tables when the trace omits them.
                 "source_agent_id": optional_arg("source_agent_id", "author_id"),
-                "target_agent_id": optional_arg("target_agent_id", "target_user_id", "parent_author_id"),
+                "target_agent_id": optional_arg(
+                    "target_agent_id",
+                    "target_user_id",
+                    "parent_author_id",
+                    "follow_id",
+                    "mute_id",
+                ),
                 "post_id": post_id,
                 "comment_id": comment_id,
                 "parent_comment_id": optional_arg("parent_comment_id", "parent_id"),
@@ -2040,25 +2266,32 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
                 "exposure_count": len(visible_post_ids),
             }
             records.append(record)
-        post_owners = {
+        post_owners = dict(db_post_owners)
+        post_owners.update({
             item["post_id"]: item["agent_id"]
             for item in records
             if item.get("action_type") == "create_post"
             and item.get("post_id") is not None
-        }
-        comment_owners = {
+        })
+        comment_owners = dict(db_comment_owners)
+        comment_owners.update({
             item["comment_id"]: item["agent_id"]
             for item in records
             if item.get("action_type") == "create_comment"
             and item.get("comment_id") is not None
-        }
+        })
         for item in records:
             if item.get("target_agent_id") is not None:
                 continue
-            if item.get("target_comment_id") in comment_owners:
-                item["target_agent_id"] = comment_owners[item["target_comment_id"]]
-            elif item.get("target_post_id") in post_owners:
-                item["target_agent_id"] = post_owners[item["target_post_id"]]
+            target_author = relation_lookup(
+                comment_owners, item.get("target_comment_id")
+            )
+            if target_author is None:
+                target_author = relation_lookup(
+                    post_owners, item.get("target_post_id")
+                )
+            if target_author is not None:
+                item["target_agent_id"] = target_author
         for item in records:
             action_type = str(item.get("action_type", "")).lower()
             if action_type not in {"create_post", "create_comment"}:
@@ -2385,6 +2618,7 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
             "artifacts": {
                 "complete_trace": "social_actions.jsonl",
                 "agent_round_states": "agent_round_states.jsonl",
+                "interaction_edges": "interaction_edges.jsonl",
                 "round_metrics": "round_metrics.csv",
                 "agent_changes": "agent_changes.csv",
             },

@@ -539,6 +539,30 @@ def test_s1_batch_summary_lock_does_not_raise(monkeypatch, tmp_path):
     assert "locked" in manifest["summary_write_error"]
 
 
+def test_s1_batch_run_sync_keeps_worker_in_current_process(monkeypatch, tmp_path):
+    runner = S1BatchRunner(storage_dir=tmp_path)
+    batch_id = "s1_batch_sync123"
+    batch_dir = tmp_path / batch_id
+    batch_dir.mkdir()
+    runner._write_json(
+        batch_dir / "manifest.json",
+        {"batch_id": batch_id, "status": "prepared", "runs": []},
+    )
+
+    def fake_execute(received_batch_id):
+        assert received_batch_id == batch_id
+        manifest = runner._read_json(batch_dir / "manifest.json")
+        assert manifest["status"] == "queued"
+        manifest["status"] = "completed"
+        runner._write_json(batch_dir / "manifest.json", manifest)
+
+    monkeypatch.setattr(runner, "_execute", fake_execute)
+
+    result = runner.run_sync(batch_id)
+
+    assert result["status"] == "completed"
+
+
 def test_source_resolver_uses_one_public_feed_only_when_attribution_is_missing():
     from app.finance.dataset import FinancialScenario
 
@@ -770,6 +794,20 @@ def test_s1_exports_complete_oasis_trace_with_social_rounds(monkeypatch, tmp_pat
         connection.execute(
             "CREATE TABLE trace (user_id INTEGER, created_at DATETIME, action TEXT, info TEXT)"
         )
+        connection.execute(
+            "CREATE TABLE user (user_id INTEGER PRIMARY KEY, agent_id INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE post (post_id INTEGER PRIMARY KEY, user_id INTEGER)"
+        )
+        connection.execute(
+            "CREATE TABLE comment (comment_id INTEGER PRIMARY KEY, post_id INTEGER, user_id INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO user VALUES (?, ?)", [(20, 20), (1, 0)]
+        )
+        connection.execute("INSERT INTO post VALUES (?, ?)", (1, 20))
+        connection.execute("INSERT INTO comment VALUES (?, ?, ?)", (1, 1, 1))
         connection.executemany(
             "INSERT INTO trace VALUES (?, ?, ?, ?)",
             [
@@ -794,6 +832,8 @@ def test_s1_exports_complete_oasis_trace_with_social_rounds(monkeypatch, tmp_pat
     assert records[1]["round_source"] == "oasis_trace_rowid_range"
     assert records[-1]["target_agent_id"] == 20
     assert records[2]["target_comment_id"] is None
+    assert records[2]["target_post_id"] == 1
+    assert records[2]["target_agent_id"] == 20
     counts = service._social_counts(run_dir)
     assert counts[0]["total"] == 3
     assert counts[0]["comment"] == 1
@@ -998,3 +1038,84 @@ def test_s1_exposure_edges_preserve_content_and_auditable_stance(tmp_path):
     assert all(edge["content_stance"] == "informational" for edge in edges)
     assert all(edge["stance_source"] == "source_event" for edge in edges)
     assert all(edge["first_seen_round"] == 1 for edge in edges)
+    feed_edge = next(edge for edge in edges if edge["exposure_type"] == "feed_visible")
+    direct_edge = next(edge for edge in edges if edge["exposure_type"] == "direct_action")
+    assert feed_edge["edge_layer"] == "exposure_opportunity"
+    assert feed_edge["interaction_sign"] is None
+    assert feed_edge["is_first_exposure"] is True
+    assert feed_edge["is_self_authored"] is False
+    assert direct_edge["edge_layer"] == "direct_interaction"
+    assert direct_edge["interaction_sign"] == 1
+
+
+def test_s1_interaction_edges_keep_typed_signed_relations(tmp_path):
+    service = S1ExperimentService(storage_dir=tmp_path / "finance")
+    run_dir = tmp_path / "finance" / "s1_reddit_interaction_test"
+    run_dir.mkdir(parents=True)
+    manifest = {
+        "run_id": "s1_reddit_interaction_test",
+        "replicate_id": "rep-1",
+        "agent_set_version": "n10",
+        "sampling_method": "full",
+        "data_split": "calibration",
+        "input_snapshot_hash": "hash",
+        "prompt_version": "v1",
+        "prompt_hash": "prompt",
+        "random_seed": 1,
+        "scenario_id": "SCN_001",
+    }
+    actions = [
+        {
+            "trace_id": 3,
+            "agent_class": "investor",
+            "agent_id": 0,
+            "round": 1,
+            "timestamp": "2026-01-01T00:02:00",
+            "action_type": "dislike_comment",
+            "target_agent_id": 2,
+            "target_comment_id": 7,
+            "action_args": {"comment_id": 7},
+        },
+        {
+            "trace_id": 4,
+            "agent_class": "investor",
+            "agent_id": 0,
+            "round": 1,
+            "timestamp": "2026-01-01T00:03:00",
+            "action_type": "follow",
+            "target_agent_id": None,
+            "action_args": {"follow_id": 3},
+        },
+        {
+            "trace_id": 5,
+            "agent_class": "investor",
+            "agent_id": 0,
+            "round": 1,
+            "timestamp": "2026-01-01T00:04:00",
+            "action_type": "create_comment",
+            "target_agent_id": None,
+            "action_args": {"content": "top-level"},
+        },
+    ]
+    exposure_edges = [
+        {
+            "trace_id": 3,
+            "exposure_type": "direct_action",
+            "author_agent_id": 2,
+        }
+    ]
+
+    rows = service._build_interaction_edges(
+        run_dir, manifest, actions, exposure_edges
+    )
+
+    assert len(rows) == 2
+    assert [(row["action_type"], row["interaction_sign"]) for row in rows] == [
+        ("dislike_comment", -1),
+        ("follow", 1),
+    ]
+    assert rows[0]["target_agent_id"] == 2
+    assert rows[0]["content_type"] == "comment"
+    assert rows[1]["target_agent_id"] == 3
+    assert rows[1]["interaction_kind"] == "agent_relation"
+    assert service.get_interaction_edges("s1_reddit_interaction_test") == rows
