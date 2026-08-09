@@ -358,6 +358,27 @@ GET  /api/finance/s1/reddit/<run_id>/stance-annotations
 GET  /api/finance/s1/reddit/<run_id>/exposure-edges-annotated
 ```
 
+### K=10 Agent 子集离线枚举
+
+主实验已经按五个 seed、18 个场景完成 K=4..9 的 847 个组合枚举，结果位于：
+
+```text
+Dataset/agent_subset_enumeration_k10_v2/
+```
+
+如需重新计算，使用：
+
+```powershell
+cd MiroFish/backend
+.venv/Scripts/python.exe scripts/enumerate_k10_downsampling.py `
+  --k-values 4 5 6 7 8 9 `
+  --output-dir ../../Dataset/agent_subset_enumeration_k10_v2
+```
+
+Profile 消融使用 `--no-profile-constraints --k-values 1 2 3 4 5 6 7 8 9`，输出到
+`Dataset/agent_subset_enumeration_k10_no_profile_v2/`。中断后可加 `--resume` 复用已经生成的
+`scores_kXX.csv.gz`。枚举是离线筛选，入选候选仍必须进行真实缩减 Agent 重跑。
+
 根目录的 `npm run backend` 会优先使用 `backend/.venv`。因此在 Windows 上已有项目虚拟环境时，不要求额外安装 `uv`；如果两者都不存在，脚本才会回退到系统 Python。
 
 ## 静态验证

@@ -1,4 +1,4 @@
-"""Build and analyze an 18-scenario, K=10 S1 round experiment dataset."""
+"""Build and analyze an 18-scenario S1 fixed-round experiment dataset."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="destination; defaults to Dataset/s1_round_selection_<rounds>rounds_k10_seed<seed>_v2",
+        help="destination; defaults to a Dataset directory derived from rounds, K, and seed",
     )
     return parser.parse_args()
 
@@ -49,7 +49,12 @@ def parse_args() -> argparse.Namespace:
 def dataset_version(manifest: Mapping[str, Any]) -> str:
     rounds = int(manifest["social_rounds"])
     seed = int(manifest["random_seed"])
-    return f"s1_round_selection_{rounds}rounds_k10_seed{seed}_v2"
+    agent_count = int(manifest.get("investor_agent_count", 10))
+    if manifest.get("data_split") == "profile_id_permutation":
+        return f"s1_profile_id_permutation_{rounds}rounds_k{agent_count}_seed{seed}_v1"
+    if manifest.get("data_split") == "agent_subset_rerun_validation":
+        return f"s1_agent_subset_{rounds}rounds_k{agent_count}_seed{seed}_v1"
+    return f"s1_round_selection_{rounds}rounds_k{agent_count}_seed{seed}_v2"
 
 
 def read_json(path: Path) -> Any:
@@ -450,6 +455,7 @@ def restore_direct_content_exposures(
 def derive_interaction_edges(
     actions: Sequence[Mapping[str, Any]],
     exposures: Sequence[Mapping[str, Any]],
+    investor_agent_count: int = 10,
 ) -> list[dict[str, Any]]:
     """Recover typed direct relations from preserved S1 audit artifacts."""
     supported = {
@@ -480,7 +486,7 @@ def derive_interaction_edges(
             round_number = int(action.get("round", 0) or 0)
         except (KeyError, TypeError, ValueError):
             continue
-        if not 0 <= actor_id < 10 or round_number < 1:
+        if not 0 <= actor_id < investor_agent_count or round_number < 1:
             continue
         kind, sign, content_type, content_key = supported[action_type]
         args = action.get("action_args") or {}
@@ -525,7 +531,9 @@ def derive_interaction_edges(
                 "actor_class": "investor",
                 "target_agent_id": normalized_target_id,
                 "target_class": (
-                    "investor" if normalized_target_id < 10 else "source"
+                    "investor"
+                    if normalized_target_id < investor_agent_count
+                    else "source"
                 ),
                 "action_type": action_type,
                 "interaction_kind": kind,
@@ -553,6 +561,9 @@ def analyze_and_build(batch_dir: Path, output_dir: Path) -> dict[str, Any]:
     if manifest.get("status") != "completed":
         raise ValueError("batch must be completed")
     max_round = int(manifest.get("social_rounds", 0))
+    investor_agent_count = int(manifest.get("investor_agent_count", 10))
+    if investor_agent_count < 1:
+        raise ValueError("batch investor_agent_count must be positive")
     if max_round < SELECTED_ROUND:
         raise ValueError(
             f"this dataset builder requires at least {SELECTED_ROUND} rounds"
@@ -645,7 +656,11 @@ def analyze_and_build(batch_dir: Path, output_dir: Path) -> dict[str, Any]:
             for row in read_jsonl(run_dir / "interaction_edges.jsonl")
         ]
         if not interactions:
-            interactions = derive_interaction_edges(actions, exposures)
+            interactions = derive_interaction_edges(
+                actions,
+                exposures,
+                investor_agent_count,
+            )
         states = [
             with_provenance(row, scenario_id, run_id)
             for row in read_jsonl(run_dir / "agent_round_states.jsonl")
@@ -843,7 +858,7 @@ def analyze_and_build(batch_dir: Path, output_dir: Path) -> dict[str, Any]:
             agent_id = int(row["agent_id"])
         except (KeyError, TypeError, ValueError):
             continue
-        if agent_id < 10 and int(row.get("round", 0) or 0) > 0:
+        if agent_id < investor_agent_count and int(row.get("round", 0) or 0) > 0:
             actions_by_key[(row["scenario_id"], int(row["round"]), agent_id)].append(row)
     exposures_by_key: dict[tuple[str, int, int], list[dict[str, Any]]] = defaultdict(list)
     for row in unique_exposures:
@@ -854,7 +869,7 @@ def analyze_and_build(batch_dir: Path, output_dir: Path) -> dict[str, Any]:
     panel_rows: list[dict[str, Any]] = []
     for scenario_id in sorted(actual_direction):
         for round_number in range(1, max_round + 1):
-            for agent_id in range(10):
+            for agent_id in range(investor_agent_count):
                 before = snapshots_by_key.get((scenario_id, round_number - 1, agent_id), {})
                 after = snapshots_by_key.get((scenario_id, round_number, agent_id), {})
                 before_vector = probability_vector(before)
@@ -1192,7 +1207,12 @@ def analyze_and_build(batch_dir: Path, output_dir: Path) -> dict[str, Any]:
         "source_batch_id": manifest["batch_id"],
         "design": {
             "scenario_count": len(scenario_runs),
-            "agent_count_per_scenario": 10,
+            "agent_count_per_scenario": investor_agent_count,
+            "selected_full_population_agent_ids": manifest.get(
+                "selected_full_population_agent_ids", []
+            ),
+            "agent_set_version": manifest.get("agent_set_version"),
+            "sampling_method": manifest.get("sampling_method"),
             "rounds": max_round,
             "random_seed": manifest.get("random_seed"),
             "selected_provisional_round": SELECTED_ROUND,
@@ -1296,7 +1316,7 @@ def analyze_and_build(batch_dir: Path, output_dir: Path) -> dict[str, Any]:
         (scenario_id, round_number, agent_id)
         for scenario_id in actual_direction
         for round_number in range(max_round + 1)
-        for agent_id in range(10)
+        for agent_id in range(investor_agent_count)
     }
     post_matches = 0
     post_count = 0
@@ -1387,8 +1407,10 @@ def analyze_and_build(batch_dir: Path, output_dir: Path) -> dict[str, Any]:
         quality["stance_annotation_failure_count"] == 0,
         quality["exposure_layer_count_mismatch"] == 0,
         quality["social_self_exposure_leak_count"] == 0,
-        quality["post_social_prediction_count"] == 180,
-        quality["post_social_matching_final_round_count"] == 180,
+        quality["post_social_prediction_count"]
+        == len(scenario_runs) * investor_agent_count,
+        quality["post_social_matching_final_round_count"]
+        == len(scenario_runs) * investor_agent_count,
         quality["extra_post_social_llm_calls"] == 0,
     ))
     write_json(output_dir / "quality_report.json", quality)
@@ -1477,7 +1499,7 @@ def render_report(
 
 ## 结论
 
-本批实验固定使用随机种子 **{seed}**、10 个 Agent 和 {max_round} 轮互动。它的主要用途是复核已经暂定的 **6 轮基准**在新随机种子下是否保持相近性质，而不是利用 seed={seed} 的结果重新挑选最佳轮次。
+本批实验固定使用随机种子 **{seed}**、{summary['design']['agent_count_per_scenario']} 个 Agent 和 {max_round} 轮互动。它的主要用途是复核已经暂定的 **6 轮基准**在新随机种子下是否保持相近性质，而不是利用 seed={seed} 的结果重新挑选最佳轮次。
 
 从 pre-social 到第 6 轮，个体方向准确率由 **{pct(r0['individual_direction_accuracy'])}** 变为 **{pct(r6['individual_direction_accuracy'])}**，场景多数方向正确数由 **{int(r0['majority_correct_scenarios'])}/18** 变为 **{int(r6['majority_correct_scenarios'])}/18**。第 6 轮相邻轮信念 JS 为 **{num(r6['transition_mean_js'])} bits**，累计方向改判率为 **{pct(r6['cumulative_direction_flip_rate'])}**。这些结果用于衡量 seed 稳健性，不能单独证明第 6 轮收敛或最优。
 

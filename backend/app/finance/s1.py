@@ -42,6 +42,7 @@ from .roles import (
     DEFAULT_AGENT_SET_VERSION as K10_AGENT_SET_VERSION,
     DEFAULT_SAMPLING_METHOD as K10_SAMPLING_METHOD,
     build_c0_profiles,
+    normalize_selected_agent_ids,
     profile_prompt_text,
 )
 from .source_resolver import FinanceEventSourceResolver
@@ -64,9 +65,8 @@ class S1ExperimentService:
     # The generic runner still requires a time step. It is an internal pacing
     # value only; S1 rounds are interaction steps, not real-world minutes.
     DEFAULT_MINUTES_PER_ROUND = 30
-    # OASIS Reddit currently assigns Agent IDs by profile-list position rather
-    # than honoring a profile's user_id. Keep the K=10 investors first (0-9);
-    # dynamic source accounts then receive contiguous IDs starting at 10.
+    # Default boundary for existing K=10 runs. Reduced runs persist their
+    # actual investor count and use it as the per-run source boundary.
     SOURCE_AGENT_START = C0_AGENT_COUNT
     RUN_ID_PATTERN = re.compile(r"s1_reddit_[A-Za-z0-9_-]{6,64}")
     _background_lock = threading.Lock()
@@ -346,6 +346,7 @@ class S1ExperimentService:
     @staticmethod
     def _s1_investor_profiles(
         scenario: FinancialScenario,
+        selected_full_population_agent_ids: Optional[Sequence[int]] = None,
     ) -> List[Dict[str, Any]]:
         history_lines = [
             f"{index}. [{event.get('event_id')} | {event.get('event_time')}] "
@@ -354,7 +355,10 @@ class S1ExperimentService:
         ]
         history_memory = "\n".join(history_lines)
         profiles = []
-        for profile in build_c0_profiles():
+        selected_ids = normalize_selected_agent_ids(
+            selected_full_population_agent_ids
+        )
+        for profile in build_c0_profiles(selected_ids):
             role_text = profile_prompt_text(profile)
             persona = (
                 f"你是{profile['role_label']}，编号为{profile['agent_key']}。"
@@ -377,9 +381,35 @@ class S1ExperimentService:
             item.setdefault("country", "CN")
             item.setdefault("interested_topics", ["A股", "公司公告"])
             profiles.append(item)
-        if len(profiles) != C0_AGENT_COUNT:
-            raise RuntimeError("S1 investor profile count does not equal C0 count")
+        if len(profiles) != len(selected_ids):
+            raise RuntimeError("S1 investor profile count does not equal selection")
         return profiles
+
+    @staticmethod
+    def _apply_profile_id_permutation(
+        profiles: Sequence[Dict[str, Any]],
+        permutation: Optional[Sequence[int]],
+    ) -> tuple[List[Dict[str, Any]], List[int]]:
+        """Assign canonical Profiles to runtime IDs without changing identity."""
+        profile_count = len(profiles)
+        resolved = list(range(profile_count)) if permutation is None else list(permutation)
+        if any(isinstance(value, bool) or not isinstance(value, int) for value in resolved):
+            raise ValueError("profile_id_permutation must contain integer Profile IDs")
+        if len(resolved) != profile_count or sorted(resolved) != list(range(profile_count)):
+            raise ValueError(
+                "profile_id_permutation must contain every canonical Profile ID exactly once"
+            )
+        by_canonical_id = {
+            int(profile["user_id"]): profile
+            for profile in profiles
+        }
+        permuted: List[Dict[str, Any]] = []
+        for runtime_id, canonical_agent_id in enumerate(resolved):
+            item = dict(by_canonical_id[canonical_agent_id])
+            item["canonical_agent_id"] = canonical_agent_id
+            item["user_id"] = runtime_id
+            permuted.append(item)
+        return permuted, resolved
 
     @staticmethod
     def _load_graph_entities(graph_id: str) -> List[EntityNode]:
@@ -462,6 +492,8 @@ class S1ExperimentService:
         agent_set_version: Optional[str] = None,
         sampling_method: str = DEFAULT_SAMPLING_METHOD,
         random_seed: Optional[int] = None,
+        profile_id_permutation: Optional[Sequence[int]] = None,
+        selected_full_population_agent_ids: Optional[Sequence[int]] = None,
     ) -> Dict[str, Any]:
         if isinstance(social_rounds, bool) or not isinstance(social_rounds, int):
             raise ValueError("social_rounds must be an integer")
@@ -510,7 +542,23 @@ class S1ExperimentService:
         if run_dir.exists() and any(run_dir.iterdir()):
             raise ValueError(f"S1 run already exists: {run_id}")
 
-        investors = self._s1_investor_profiles(scenario)
+        resolved_selected_agent_ids = normalize_selected_agent_ids(
+            selected_full_population_agent_ids
+        )
+        canonical_investors = self._s1_investor_profiles(
+            scenario,
+            resolved_selected_agent_ids,
+        )
+        selected_full_population_agent_ids = [
+            int(profile["full_population_agent_id"])
+            for profile in canonical_investors
+        ]
+        investors, resolved_profile_id_permutation = (
+            self._apply_profile_id_permutation(
+                canonical_investors,
+                profile_id_permutation,
+            )
+        )
         investor_count = len(investors)
         graph_entities = (
             self._load_graph_entities(str(graph_id))
@@ -521,7 +569,7 @@ class S1ExperimentService:
             graph_entities
         ).resolve(
             scenario,
-            source_agent_start=self.SOURCE_AGENT_START,
+            source_agent_start=investor_count,
             source_mode=resolved_source_mode,
             graph_id=graph_id,
         )
@@ -600,6 +648,7 @@ class S1ExperimentService:
                 "investor_agent_mapping": [
                     {
                         "agent_id": int(profile["user_id"]),
+                        "canonical_agent_id": int(profile["canonical_agent_id"]),
                         "full_population_agent_id": int(
                             profile["full_population_agent_id"]
                         ),
@@ -634,6 +683,10 @@ class S1ExperimentService:
         }
         prompt_hash = self._sha256_json(
             {
+                "profile_id_permutation": resolved_profile_id_permutation,
+                "runtime_agent_mapping": config["finance_s1"][
+                    "investor_agent_mapping"
+                ],
                 "belief_measurement": [
                     {
                         "agent_id": int(profile["user_id"]),
@@ -653,6 +706,7 @@ class S1ExperimentService:
                 "input_snapshot_hash": input_snapshot_hash,
                 "prompt_hash": prompt_hash,
                 "random_seed": random_seed,
+                "profile_id_permutation": resolved_profile_id_permutation,
             }
         )
         self._write_json(simulation_dir / "simulation_config.json", config)
@@ -706,13 +760,12 @@ class S1ExperimentService:
             "dataset_path": str(loader.dataset_path),
             "scenario_count": 1,
             "investor_agent_count": investor_count,
-            "selected_full_population_agent_ids": [
-                int(profile["full_population_agent_id"])
-                for profile in investors
-            ],
+            "selected_full_population_agent_ids": selected_full_population_agent_ids,
+            "profile_id_permutation": resolved_profile_id_permutation,
             "runtime_agent_mapping": [
                 {
                     "agent_id": int(profile["user_id"]),
+                    "canonical_agent_id": int(profile["canonical_agent_id"]),
                     "full_population_agent_id": int(
                         profile["full_population_agent_id"]
                     ),
@@ -1375,7 +1428,10 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
             raise ValueError("stage must be pre_social or post_social")
         parser = C0ExperimentService()
         social_counts = (
-            S1ExperimentService._social_counts(run_dir)
+            S1ExperimentService._social_counts(
+                run_dir,
+                [int(profile["user_id"]) for profile in profiles],
+            )
             if stage == "post_social" else {}
         )
         records = []
@@ -1619,7 +1675,10 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
             for item in belief_snapshots
             if int(item.get("round", -1)) == final_round
         }
-        social_counts = S1ExperimentService._social_counts(run_dir)
+        social_counts = S1ExperimentService._social_counts(
+            run_dir,
+            [int(profile["user_id"]) for profile in profiles],
+        )
         records: List[Dict[str, Any]] = []
         for profile in profiles:
             agent_id = int(profile["user_id"])
@@ -1678,6 +1737,9 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
         as a separate layer and are also normalized into
         ``interaction_edges.jsonl``.
         """
+        investor_agent_count = int(
+            manifest.get("investor_agent_count", self.SOURCE_AGENT_START)
+        )
         post_owners: Dict[Any, int] = {}
         comment_owners: Dict[Any, int] = {}
         content: Dict[tuple[str, Any], Dict[str, Any]] = {}
@@ -1735,7 +1797,7 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
                         continue
                     author_id = comment.get("user_id", comment.get("author_id"))
                     text = comment.get("content", "")
-                    if author_id is not None and int(author_id) >= self.SOURCE_AGENT_START:
+                    if author_id is not None and int(author_id) >= investor_agent_count:
                         label, score, source = "informational", 0.0, "source_event"
                     else:
                         label, score, source = self._classify_content_stance(text)
@@ -1886,6 +1948,9 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
         exposure_edges: Sequence[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         """Normalize explicit Agent actions separately from feed exposure."""
+        investor_agent_count = int(
+            manifest.get("investor_agent_count", self.SOURCE_AGENT_START)
+        )
         supported = {
             "like_post": ("reaction", 1, "post", "target_post_id"),
             "dislike_post": ("reaction", -1, "post", "target_post_id"),
@@ -1955,7 +2020,7 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
                     "target_agent_id": target_agent_id,
                     "target_class": (
                         "investor"
-                        if target_agent_id < self.SOURCE_AGENT_START else "source"
+                        if target_agent_id < investor_agent_count else "source"
                     ),
                     "action_type": action_type,
                     "interaction_kind": kind,
@@ -1968,17 +2033,25 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
         return records
 
     @staticmethod
-    def _social_counts(run_dir: Path) -> Dict[int, Dict[str, int]]:
+    def _social_counts(
+        run_dir: Path,
+        investor_agent_ids: Optional[Sequence[int]] = None,
+    ) -> Dict[int, Dict[str, int]]:
         path = run_dir / "social_actions.jsonl"
         if not path.exists():
             return {}
+        allowed_ids = (
+            set(range(S1ExperimentService.SOURCE_AGENT_START))
+            if investor_agent_ids is None
+            else {int(agent_id) for agent_id in investor_agent_ids}
+        )
         counts: Dict[int, Dict[str, int]] = {}
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             record = json.loads(line)
             agent_id = int(record.get("agent_id", -1))
-            if not 0 <= agent_id < S1ExperimentService.SOURCE_AGENT_START:
+            if agent_id not in allowed_ids:
                 continue
             action = str(record.get("action_type", "")).lower()
             item = counts.setdefault(
@@ -2071,6 +2144,9 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
     def _export_social_actions(self, run_dir: Path) -> List[Dict[str, Any]]:
         """Export the authoritative OASIS trace with an inferred social round."""
         manifest = self._read_json(run_dir / "manifest.json")
+        investor_agent_count = int(
+            manifest.get("investor_agent_count", self.SOURCE_AGENT_START)
+        )
         simulation_dir = (
             Path(SimulationManager.SIMULATION_DATA_DIR) / manifest["simulation_id"]
         )
@@ -2111,7 +2187,7 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
             for round_number, start_rowid, end_rowid in trace_ranges:
                 if start_rowid < trace_id <= end_rowid:
                     return round_number, "oasis_trace_rowid_range"
-            if agent_id >= self.SOURCE_AGENT_START:
+            if agent_id >= investor_agent_count:
                 return 0, "source_initialization"
             for round_number, start, end in intervals:
                 if start <= stamp <= end:
@@ -2233,7 +2309,7 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
                 "agent_id": int(agent_id),
                 "agent_class": (
                     "investor"
-                    if int(agent_id) < self.SOURCE_AGENT_START else "source"
+                    if int(agent_id) < investor_agent_count else "source"
                 ),
                 "action_type": action_type,
                 "action_args": action_args,

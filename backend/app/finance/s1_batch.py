@@ -8,11 +8,12 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 from ..config import Config
 from ..utils.logger import get_logger
 from .dataset import FinancialDatasetLoader, PROJECT_ROOT
+from .roles import normalize_selected_agent_ids
 from .s1 import S1ExperimentService
 
 
@@ -34,6 +35,7 @@ class S1BatchRunner:
         "sampling_method",
         "data_split",
         "random_seed",
+        "profile_id_permutation",
         "scenario_id",
         "run_id",
         "status",
@@ -88,6 +90,8 @@ class S1BatchRunner:
         agent_set_version: Optional[str] = None,
         sampling_method: str = S1ExperimentService.DEFAULT_SAMPLING_METHOD,
         random_seed: Optional[int] = None,
+        profile_id_permutation: Optional[Sequence[int]] = None,
+        selected_full_population_agent_ids: Optional[Sequence[int]] = None,
     ) -> Dict[str, Any]:
         if isinstance(social_rounds, bool) or not isinstance(social_rounds, int):
             raise ValueError("social_rounds must be an integer")
@@ -108,6 +112,26 @@ class S1BatchRunner:
             or not 0 <= random_seed <= 0xFFFFFFFF
         ):
             raise ValueError("random_seed must be an integer between 0 and 4294967295")
+        resolved_selected_agent_ids = normalize_selected_agent_ids(
+            selected_full_population_agent_ids
+        )
+        investor_agent_count = len(resolved_selected_agent_ids)
+        resolved_profile_id_permutation = (
+            list(range(investor_agent_count))
+            if profile_id_permutation is None
+            else list(profile_id_permutation)
+        )
+        if (
+            any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in resolved_profile_id_permutation
+            )
+            or sorted(resolved_profile_id_permutation)
+            != list(range(investor_agent_count))
+        ):
+            raise ValueError(
+                "profile_id_permutation must contain every canonical Profile ID exactly once"
+            )
         graph_manifest = Path(
             graph_manifest_path or self.DEFAULT_GRAPH_MANIFEST
         ).resolve()
@@ -145,6 +169,11 @@ class S1BatchRunner:
                 sampling_method or S1ExperimentService.DEFAULT_SAMPLING_METHOD
             ),
             "random_seed": random_seed,
+            "profile_id_permutation": resolved_profile_id_permutation,
+            "investor_agent_count": investor_agent_count,
+            "selected_full_population_agent_ids": list(
+                resolved_selected_agent_ids
+            ),
             "scenario_count": len(completed),
             "completed_scenario_count": 0,
             "failed_scenario_count": 0,
@@ -192,6 +221,11 @@ class S1BatchRunner:
                     ),
                     "data_split": metrics.get("data_split") or manifest.get("data_split"),
                     "random_seed": metrics.get("random_seed", manifest.get("random_seed")),
+                    "profile_id_permutation": json.dumps(
+                        manifest.get("profile_id_permutation", []),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
                     "scenario_id": item.get("scenario_id"),
                     "run_id": item.get("run_id"),
                     "status": item.get("status"),
@@ -313,6 +347,12 @@ class S1BatchRunner:
                             S1ExperimentService.DEFAULT_SAMPLING_METHOD,
                         ),
                         random_seed=manifest.get("random_seed"),
+                        profile_id_permutation=manifest.get(
+                            "profile_id_permutation"
+                        ),
+                        selected_full_population_agent_ids=manifest.get(
+                            "selected_full_population_agent_ids"
+                        ),
                     )
                     item.update(
                         {"status": "running", "run_id": run_manifest["run_id"]}

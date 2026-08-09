@@ -90,3 +90,35 @@ def test_comment_parent_is_recovered_as_typed_direct_interaction() -> None:
     assert interactions[0]["target_agent_id"] == 12
     assert interactions[0]["content_type"] == "post"
     assert interactions[0]["content_id"] == 3
+
+
+def test_k8_dataset_version_and_source_boundary() -> None:
+    manifest = {
+        "social_rounds": 6,
+        "random_seed": 42,
+        "investor_agent_count": 8,
+        "data_split": "agent_subset_rerun_validation",
+    }
+    assert MODULE.dataset_version(manifest) == "s1_agent_subset_6rounds_k8_seed42_v1"
+
+    actions = [
+        {
+            "scenario_id": "SCN_001",
+            "run_id": "run-1",
+            "trace_id": 12,
+            "round": 1,
+            "timestamp": "2026-01-01T00:00:00",
+            "agent_id": 7,
+            "agent_class": "investor",
+            "action_type": "follow",
+            "target_agent_id": 8,
+            "action_args": {"follow_id": 8},
+        }
+    ]
+    interactions = MODULE.derive_interaction_edges(
+        actions,
+        [],
+        investor_agent_count=8,
+    )
+    assert interactions[0]["actor_class"] == "investor"
+    assert interactions[0]["target_class"] == "source"

@@ -33,6 +33,12 @@ def test_parse_seed_tokens_accepts_spaces_and_commas():
     ]
 
 
+def test_parse_agent_id_tokens_accepts_k8_candidate():
+    assert seed_sweep.parse_agent_id_tokens(["1,3,4", "5", "9,13,14,17"]) == [
+        1, 3, 4, 5, 9, 13, 14, 17
+    ]
+
+
 @pytest.mark.parametrize(
     "tokens, message",
     [
@@ -54,6 +60,46 @@ def test_build_plan_fixes_k10_six_round_contract(tmp_path):
     assert plan["scenario_count_per_seed"] == 18
     assert plan["total_scenario_runs"] == 36
     assert plan["calls_external_llm"] is False
+
+
+def test_profile_id_permutation_is_reproducible_derangement():
+    first = seed_sweep.build_profile_id_permutation(42)
+    second = seed_sweep.build_profile_id_permutation(42)
+
+    assert first == second
+    assert sorted(first) == list(range(10))
+    assert all(profile_id != runtime_id for runtime_id, profile_id in enumerate(first))
+    assert first != seed_sweep.build_profile_id_permutation(999)
+
+
+def test_build_plan_records_seed_specific_profile_permutations(tmp_path):
+    plan = seed_sweep.build_plan(
+        [42, 999],
+        graph_manifest(tmp_path),
+        permute_profile_ids=True,
+    )
+
+    assert plan["profile_id_permutation_enabled"] is True
+    assert plan["sampling_method"] == "paired_profile_runtime_derangement_v1"
+    assert plan["profile_id_permutations"]["42"] == (
+        seed_sweep.build_profile_id_permutation(42)
+    )
+
+
+def test_build_plan_supports_preferred_k8_candidate(tmp_path):
+    selected_ids = [1, 3, 4, 5, 9, 13, 14, 17]
+    plan = seed_sweep.build_plan(
+        [42, 999],
+        graph_manifest(tmp_path),
+        selected_full_population_agent_ids=selected_ids,
+    )
+
+    assert plan["agent_count"] == 8
+    assert plan["selected_full_population_agent_ids"] == selected_ids
+    assert plan["agent_set_version"] == "n10_k8_enum_best_v1"
+    assert plan["sampling_method"] == "offline_exact_enumeration_k10_v2_candidate"
+    assert plan["data_split"] == "agent_subset_rerun_validation"
+    assert plan["profile_id_permutations"]["42"] == list(range(8))
 
 
 def test_run_sweep_creates_one_serial_batch_per_seed(monkeypatch, tmp_path):
@@ -90,8 +136,87 @@ def test_run_sweep_creates_one_serial_batch_per_seed(monkeypatch, tmp_path):
     assert [item["random_seed"] for item in prepared] == [4005, 4006]
     assert all(item["social_rounds"] == 6 for item in prepared)
     assert all(item["agent_set_version"] == "n10_k10_exact_v1" for item in prepared)
+    assert all(item["profile_id_permutation"] == list(range(10)) for item in prepared)
     assert [item["completed_scenario_count"] for item in result["batches"]] == [
         18,
         18,
     ]
     assert (tmp_path / "finance" / result["sweep_id"] / "manifest.json").exists()
+
+
+def test_run_sweep_propagates_profile_permutation(monkeypatch, tmp_path):
+    prepared = []
+
+    class FakeRunner:
+        def __init__(self, *, storage_dir):
+            self.storage_dir = storage_dir
+
+        def prepare(self, **kwargs):
+            prepared.append(kwargs)
+            batch_id = "s1_batch_profileperm"
+            batch_dir = self.storage_dir / batch_id
+            batch_dir.mkdir()
+            (batch_dir / "manifest.json").write_text("{}", encoding="utf-8")
+            return {"batch_id": batch_id}
+
+        def run_sync(self, batch_id):
+            return {
+                "batch_id": batch_id,
+                "status": "completed",
+                "completed_scenario_count": 18,
+                "failed_scenario_count": 0,
+            }
+
+    monkeypatch.setattr(seed_sweep, "S1BatchRunner", FakeRunner)
+    result = seed_sweep.run_sweep(
+        seeds=[42],
+        graph_manifest=graph_manifest(tmp_path),
+        storage_dir=tmp_path / "finance",
+        permute_profile_ids=True,
+    )
+
+    assert result["status"] == "completed"
+    assert prepared[0]["data_split"] == "profile_id_permutation"
+    assert prepared[0]["sampling_method"] == "paired_profile_runtime_derangement_v1"
+    assert prepared[0]["profile_id_permutation"] == (
+        seed_sweep.build_profile_id_permutation(42)
+    )
+
+
+def test_run_sweep_propagates_k8_candidate(monkeypatch, tmp_path):
+    prepared = []
+    selected_ids = [1, 3, 4, 5, 9, 13, 14, 17]
+
+    class FakeRunner:
+        def __init__(self, *, storage_dir):
+            self.storage_dir = storage_dir
+
+        def prepare(self, **kwargs):
+            prepared.append(kwargs)
+            batch_id = "s1_batch_k8candidate"
+            batch_dir = self.storage_dir / batch_id
+            batch_dir.mkdir()
+            (batch_dir / "manifest.json").write_text("{}", encoding="utf-8")
+            return {"batch_id": batch_id}
+
+        def run_sync(self, batch_id):
+            return {
+                "batch_id": batch_id,
+                "status": "completed",
+                "completed_scenario_count": 18,
+                "failed_scenario_count": 0,
+            }
+
+    monkeypatch.setattr(seed_sweep, "S1BatchRunner", FakeRunner)
+    result = seed_sweep.run_sweep(
+        seeds=[42],
+        graph_manifest=graph_manifest(tmp_path),
+        storage_dir=tmp_path / "finance",
+        selected_full_population_agent_ids=selected_ids,
+    )
+
+    assert result["status"] == "completed"
+    assert prepared[0]["selected_full_population_agent_ids"] == selected_ids
+    assert prepared[0]["profile_id_permutation"] == list(range(8))
+    assert prepared[0]["agent_set_version"] == "n10_k8_enum_best_v1"
+    assert prepared[0]["data_split"] == "agent_subset_rerun_validation"

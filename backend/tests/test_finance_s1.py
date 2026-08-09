@@ -193,6 +193,99 @@ def test_s1_reddit_prepare_uses_scenario_attributed_publishers_and_safe_events(
         assert forbidden not in safe_text
 
 
+def test_s1_prepare_applies_auditable_profile_id_permutation(monkeypatch, tmp_path):
+    simulation_dir = tmp_path / "simulations"
+    monkeypatch.setattr(SimulationManager, "SIMULATION_DATA_DIR", str(simulation_dir))
+    permutation = list(reversed(range(10)))
+    canonical_full_ids = [1, 3, 4, 5, 9, 11, 12, 13, 14, 17]
+
+    service = S1ExperimentService(storage_dir=tmp_path / "finance")
+    manifest = service.prepare(
+        scenario_id="SCN_009",
+        run_id="s1_reddit_profileperm",
+        profile_id_permutation=permutation,
+    )
+
+    assert manifest["selected_full_population_agent_ids"] == canonical_full_ids
+    assert manifest["profile_id_permutation"] == permutation
+    assert [row["agent_id"] for row in manifest["runtime_agent_mapping"]] == list(
+        range(10)
+    )
+    assert [
+        row["canonical_agent_id"] for row in manifest["runtime_agent_mapping"]
+    ] == permutation
+    assert [
+        row["full_population_agent_id"] for row in manifest["runtime_agent_mapping"]
+    ] == [canonical_full_ids[index] for index in permutation]
+
+    run_dir = tmp_path / "finance" / manifest["run_id"]
+    profiles = json.loads((run_dir / "profiles.json").read_text(encoding="utf-8"))
+    assert [profile["user_id"] for profile in profiles] == list(range(10))
+    assert [profile["canonical_agent_id"] for profile in profiles] == permutation
+    config = json.loads(
+        (
+            simulation_dir
+            / manifest["simulation_id"]
+            / "simulation_config.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert config["finance_s1"]["profile_id_permutation"] == permutation
+    assert config["finance_s1"]["investor_agent_mapping"] == manifest[
+        "runtime_agent_mapping"
+    ]
+
+
+def test_s1_prepare_supports_preferred_k8_candidate(monkeypatch, tmp_path):
+    simulation_dir = tmp_path / "simulations"
+    monkeypatch.setattr(SimulationManager, "SIMULATION_DATA_DIR", str(simulation_dir))
+    selected_ids = [1, 3, 4, 5, 9, 13, 14, 17]
+
+    service = S1ExperimentService(storage_dir=tmp_path / "finance")
+    manifest = service.prepare(
+        scenario_id="SCN_009",
+        run_id="s1_reddit_k8candidate",
+        social_rounds=6,
+        selected_full_population_agent_ids=selected_ids,
+        agent_set_version="n10_k8_enum_best_v1",
+        sampling_method="offline_exact_enumeration_k10_v2_candidate",
+    )
+
+    assert manifest["investor_agent_count"] == 8
+    assert manifest["selected_full_population_agent_ids"] == selected_ids
+    assert manifest["expected_belief_snapshot_count"] == 56
+    assert manifest["expected_prediction_count"] == 16
+    assert [row["agent_id"] for row in manifest["runtime_agent_mapping"]] == list(
+        range(8)
+    )
+    assert [
+        row["full_population_agent_id"] for row in manifest["runtime_agent_mapping"]
+    ] == selected_ids
+
+    run_dir = tmp_path / "finance" / manifest["run_id"]
+    profiles = json.loads((run_dir / "profiles.json").read_text(encoding="utf-8"))
+    sources = json.loads((run_dir / "source_profiles.json").read_text(encoding="utf-8"))
+    assert [profile["user_id"] for profile in profiles] == list(range(8))
+    assert [source["user_id"] for source in sources] == [8]
+
+    config = json.loads(
+        (simulation_dir / manifest["simulation_id"] / "simulation_config.json")
+        .read_text(encoding="utf-8")
+    )
+    assert config["finance_s1"]["tracked_agent_ids"] == list(range(8))
+    assert config["finance_s1"]["source_agent_ids"] == [8]
+    assert len(config["finance_s1"]["pre_social_interviews"]) == 8
+    assert len(config["finance_s1"]["round_belief_snapshot_interviews"]) == 8
+
+
+def test_s1_rejects_invalid_profile_id_permutation(tmp_path):
+    service = S1ExperimentService(storage_dir=tmp_path / "finance")
+    with pytest.raises(ValueError, match="every canonical Profile ID"):
+        service.prepare(
+            scenario_id="SCN_009",
+            profile_id_permutation=[0] * 10,
+        )
+
+
 def test_s1_graph_mode_reuses_zep_entities_for_dynamic_source_profiles(
     monkeypatch, tmp_path
 ):

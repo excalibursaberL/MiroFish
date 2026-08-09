@@ -15,7 +15,7 @@ in C0.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Sequence
 
 
 FULL_AGENT_COUNT = 20
@@ -362,14 +362,39 @@ def build_full_c0_profiles() -> List[Dict[str, Any]]:
     return profiles
 
 
-def build_c0_profiles() -> List[Dict[str, Any]]:
-    """Return the fixed K=10 experiment subset with contiguous runtime IDs."""
+def normalize_selected_agent_ids(
+    selected_full_population_agent_ids: Optional[Sequence[int]] = None,
+) -> tuple[int, ...]:
+    """Validate a subset of the already selected K=10 source-pool IDs."""
+    values = tuple(
+        SELECTED_AGENT_IDS
+        if selected_full_population_agent_ids is None
+        else selected_full_population_agent_ids
+    )
+    if not values:
+        raise ValueError("at least one selected Agent is required")
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+        raise ValueError("selected Agent IDs must be integers")
+    if len(set(values)) != len(values):
+        raise ValueError("selected Agent IDs must be unique")
+    if not set(values).issubset(set(SELECTED_AGENT_IDS)):
+        raise ValueError(
+            "selected Agent IDs must be a subset of the configured K=10 source pool"
+        )
+    return values
+
+
+def build_c0_profiles(
+    selected_full_population_agent_ids: Optional[Sequence[int]] = None,
+) -> List[Dict[str, Any]]:
+    """Return selected source-pool profiles with contiguous runtime IDs."""
+    selected_ids = normalize_selected_agent_ids(selected_full_population_agent_ids)
     full_profiles = {
         int(profile["full_population_agent_id"]): profile
         for profile in build_full_c0_profiles()
     }
     profiles: List[Dict[str, Any]] = []
-    for runtime_id, full_population_agent_id in enumerate(SELECTED_AGENT_IDS):
+    for runtime_id, full_population_agent_id in enumerate(selected_ids):
         try:
             profile = dict(full_profiles[full_population_agent_id])
         except KeyError as exc:
@@ -379,8 +404,8 @@ def build_c0_profiles() -> List[Dict[str, Any]]:
         profile["user_id"] = runtime_id
         profile["full_population_agent_id"] = full_population_agent_id
         profiles.append(profile)
-    if len(profiles) != C0_AGENT_COUNT:
+    if len(profiles) != len(selected_ids):
         raise RuntimeError(
-            f"experiment profile configuration must contain {C0_AGENT_COUNT} agents"
+            f"experiment profile configuration must contain {len(selected_ids)} agents"
         )
     return profiles

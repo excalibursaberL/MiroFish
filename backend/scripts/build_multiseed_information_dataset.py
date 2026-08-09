@@ -15,10 +15,11 @@ import numpy as np
 import pandas as pd
 
 
-ANALYSIS_VERSION = "s1_multiseed_k10_round6_seeds4004_42_3407_v2"
+ANALYSIS_VERSION = "s1_multiseed_k10_round6_seeds4004_42_3407_999_2887_v2"
 MAX_ROUND = 6
 AGENT_COUNT = 10
 SCENARIO_COUNT = 18
+EXPECTED_SEEDS = (42, 999, 2887, 3407, 4004)
 EPSILON = 1e-12
 DIRECTIONS = ("up", "neutral", "down")
 
@@ -54,6 +55,8 @@ def default_sources() -> list[Path]:
         root / "s1_round_selection_10rounds_k10_seed4004_v2",
         root / "s1_round_selection_6rounds_k10_seed42_v2",
         root / "s1_round_selection_6rounds_k10_seed3407_v2",
+        root / "s1_round_selection_6rounds_k10_seed999_v2",
+        root / "s1_round_selection_6rounds_k10_seed2887_v2",
     ]
 
 
@@ -974,7 +977,11 @@ def build_information_contributions(
     return contributions, seed_metrics, pair_metrics, leave_out
 
 
-def render_report(contributions: pd.DataFrame, quality: Mapping[str, Any]) -> str:
+def render_report(
+    contributions: pd.DataFrame,
+    quality: Mapping[str, Any],
+    round_metrics: pd.DataFrame,
+) -> str:
     ranked = contributions.sort_values("balanced_reference_rank")
     table_lines = [
         "| 排名 | Agent | 角色 | 预测增量 CMI（校正） | 社会立场-改判 CMI（校正） | 个体化立场-改判 CMI（校正） | 群体扰动 JS | 平均冗余 NMI | 参考分 |",
@@ -1027,7 +1034,45 @@ def render_report(contributions: pd.DataFrame, quality: Mapping[str, Any]) -> st
         f"Agent {int(row.agent_id)}" for row in ranked.head(4).itertuples()
     )
     rank_stability = quality["mean_seed_rank_spearman"]
-    return f"""# 三 seed Agent 多类信息贡献分析
+    numeric_round_metrics = round_metrics.copy()
+    numeric_columns = [
+        "round",
+        "individual_direction_accuracy",
+        "individual_balanced_accuracy",
+        "majority_accuracy_all_scenarios",
+        "mean_brier_score",
+        "mean_scenario_consensus_rate",
+        "mean_scenario_direction_entropy_bits",
+    ]
+    for column in numeric_columns:
+        numeric_round_metrics[column] = pd.to_numeric(
+            numeric_round_metrics[column], errors="coerce"
+        )
+    round_means = numeric_round_metrics.groupby("round", sort=True)[
+        numeric_columns[1:]
+    ].mean()
+    round_0 = round_means.loc[0]
+    round_5 = round_means.loc[5]
+    round_6 = round_means.loc[6]
+    seed_round_lines = [
+        "| seed | 第 5 轮个体准确率 | 第 6 轮个体准确率 | 第 5 轮多数准确率 | 第 6 轮多数准确率 | 第 5 轮 Brier | 第 6 轮 Brier |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    selected_rounds = numeric_round_metrics.loc[
+        numeric_round_metrics["round"].isin([5, 6])
+    ].set_index(["seed", "round"])
+    for seed in quality["seeds"]:
+        at_5 = selected_rounds.loc[(seed, 5)]
+        at_6 = selected_rounds.loc[(seed, 6)]
+        seed_round_lines.append(
+            f"| {seed} | {at_5['individual_direction_accuracy']:.3f} | "
+            f"{at_6['individual_direction_accuracy']:.3f} | "
+            f"{at_5['majority_accuracy_all_scenarios']:.3f} | "
+            f"{at_6['majority_accuracy_all_scenarios']:.3f} | "
+            f"{at_5['mean_brier_score']:.3f} | {at_6['mean_brier_score']:.3f} |"
+        )
+    seed_count = len(quality["seeds"])
+    return f"""# {seed_count} seed Agent 多类信息贡献分析
 
 ## 结论
 
@@ -1038,6 +1083,14 @@ def render_report(contributions: pd.DataFrame, quality: Mapping[str, Any]) -> st
 ## Agent 结果
 
 {chr(10).join(table_lines)}
+
+## 逐轮预测表现
+
+- 从 pre-social 到第 6 轮，个体方向准确率由 **{round_0['individual_direction_accuracy']:.3f}** 上升至 **{round_6['individual_direction_accuracy']:.3f}**，balanced accuracy 由 **{round_0['individual_balanced_accuracy']:.3f}** 上升至 **{round_6['individual_balanced_accuracy']:.3f}**，Brier 由 **{round_0['mean_brier_score']:.3f}** 降至 **{round_6['mean_brier_score']:.3f}**。
+- 第 5 轮到第 6 轮的五 seed 均值并未继续改善：个体准确率 **{round_5['individual_direction_accuracy']:.3f} -> {round_6['individual_direction_accuracy']:.3f}**，多数方向准确率 **{round_5['majority_accuracy_all_scenarios']:.3f} -> {round_6['majority_accuracy_all_scenarios']:.3f}**，Brier **{round_5['mean_brier_score']:.3f} -> {round_6['mean_brier_score']:.3f}**。
+- 第 6 轮多数方向准确率 **{round_6['majority_accuracy_all_scenarios']:.3f}** 低于真实标签多数类常数基线 **{quality['constant_actual_majority_accuracy']:.3f}**。因此社会互动提高了相对 pre-social 的描述性表现，但尚未形成有竞争力的预测器。
+
+{chr(10).join(seed_round_lines)}
 
 预测增量 CMI 经场景标签置换和 10-Agent BH 校正后显著的 Agent 数为 **{predictive_significant}/10**；社会立场-收益变化 CMI 为 **{social_significant}/10**；社会立场-方向改判 CMI 为 **{social_flip_significant}/10**。这三个口径检验的是跨场景关联。
 
@@ -1051,7 +1104,9 @@ def render_report(contributions: pd.DataFrame, quality: Mapping[str, Any]) -> st
 - 社会立场-收益变化 CMI 排名平均 Spearman：**{rank_stability['social_stance_return_cmi_bits']:.3f}**。
 - 社会立场-方向改判 CMI 排名平均 Spearman：**{rank_stability['social_stance_flip_cmi_bits']:.3f}**。
 
-除未条件预测 MI 外，逐 seed 排名稳定性普遍较弱。这意味着合并数据适合估计总体候选价值，但不能把某个 seed 内的 Agent 排名当作稳定个人属性。
+预测 MI 和社会曝光量指标只有弱到中等稳定性，其余逐 seed 排名接近不稳定。这意味着合并数据适合估计总体候选价值，但不能把某个 seed 内的 Agent 排名当作稳定个人属性。
+
+修正后的显式 Agent-Agent 互动图共有 **{quality['investor_interaction_count']}** 条边；跨 seed 出度排名平均 Spearman 为 **{quality['mean_out_degree_rank_spearman']:.3f}**，入度排名为 **{quality['mean_in_degree_rank_spearman']:.3f}**。拓扑角色比信息贡献排名稳定，但稳定拓扑不等于因果影响，因此图优化适合作为覆盖与连通性约束，不适合作为唯一删点目标。
 
 ## 指标定义
 
@@ -1067,7 +1122,7 @@ def render_report(contributions: pd.DataFrame, quality: Mapping[str, Any]) -> st
 
 ## 为什么只能作为参考
 
-- 真实标签只有 18 个场景，3 个 seed 是同一场景的随机重复，不是 54 个独立市场事件。
+- 真实标签只有 18 个场景，{seed_count} 个 seed 是同一批场景的随机重复，不是 {seed_count * SCENARIO_COUNT} 个独立市场事件。
 - DeepSeek 没有确定性 seed 合约，跨 seed 波动同时包含本地互动随机性和模型输出随机性。
 - 互信息用于筛选时接触了真实 T+5 标签；最终评估必须按场景留出，否则会发生选择泄漏。
 - 社会曝光不是随机分配，社会响应 CMI 是预测关联，不是因果影响或传递熵。
@@ -1078,7 +1133,7 @@ def render_report(contributions: pd.DataFrame, quality: Mapping[str, Any]) -> st
 1. 用 `agent_information_contributions.csv` 生成 K=8、K=6 候选，保留机构、成熟散户、基础散户和新手角色覆盖。
 2. 候选目标采用 mRMR/图覆盖：提高预测与社会信息，降低 Agent 间冗余，同时约束群体 JS、熵和 Profile 误差。
 3. 使用按场景分组的交叉验证；每一折只在训练场景计算 MI 和选 Agent，再在留出场景评估。
-4. 对候选子集真实重跑三个 seed。只有重跑后仍保留 K=10 的群体分布和社会互动指标，才能确认降采样有效。
+4. 对候选子集真实重跑多个 seed。只有重跑后仍保留 K=10 的群体分布和社会互动指标，才能确认降采样有效。
 
 ## 数据质量
 
@@ -1091,9 +1146,11 @@ def render_report(contributions: pd.DataFrame, quality: Mapping[str, Any]) -> st
 
 
 def render_readme(quality: Mapping[str, Any], settings: Mapping[str, Any]) -> str:
-    return f"""# 三 seed S1 联合信息贡献数据集
+    seed_count = len(quality["seeds"])
+    seed_text = "、".join(str(seed) for seed in quality["seeds"])
+    return f"""# {seed_count} seed S1 联合信息贡献数据集
 
-该目录合并 seed 4004、42、3407 的 K=10、前 6 轮 S1 数据，用于 Agent 多类信息贡献和下一阶段降采样候选分析。seed=4004 原始实验有 10 轮，本目录仅保留第 0-6 轮。
+该目录合并 seed {seed_text} 的 K=10、前 6 轮 S1 数据，用于 Agent 多类信息贡献和下一阶段降采样候选分析。seed=4004 原始实验有 10 轮，本目录仅保留第 0-6 轮。
 
 ## 推荐入口
 
@@ -1103,14 +1160,14 @@ def render_readme(quality: Mapping[str, Any], settings: Mapping[str, Any]) -> st
 - `agent_pair_redundancy.csv`：45 对 Agent 的方向 MI、NMI 和一致率。
 - `agent_seed_rank_stability.csv`：不同 seed 下逐 Agent 指标排名的两两 Spearman 相关。
 - `agent_leave_one_out_metrics.csv`：离线移除单个 Agent 后的群体概率和多数方向扰动。
-- `final_agent_observations.csv`：第 0/6 轮配对后的 540 条 Agent-场景-seed 观测。
-- `merged_agent_round_panel.csv`：3240 行社会响应分析主表。
-- `merged_agent_round_content_exposures.csv`：三 seed 的逐条去重曝光关系；feed、直接互动、自身内容及首次曝光均已分层。
-- `merged_interaction_edges.csv`：三 seed 的显式有向互动关系，与 feed 曝光分开。
+- `final_agent_observations.csv`：第 0/6 轮配对后的 {quality['final_observation_count']} 条 Agent-场景-seed 观测。
+- `merged_agent_round_panel.csv`：{quality['panel_count']} 行社会响应分析主表。
+- `merged_agent_round_content_exposures.csv`：{seed_count} seed 的逐条去重曝光关系；feed、直接互动、自身内容及首次曝光均已分层。
+- `merged_interaction_edges.csv`：{seed_count} seed 的显式有向互动关系，与 feed 曝光分开。
 
 ## 统计口径
 
-- 预测 MI 的置换单元是场景标签：同一场景的三个 seed 始终共享同一个置换标签。
+- 预测 MI 的置换单元是场景标签：同一场景的 {seed_count} 个 seed 始终共享同一个置换标签。
 - 社会响应 CMI 在每个 `Agent + seed + round` 内交换社会特征，保持轮次和 seed 的边际分布。
 - 个体化社会响应检验在每个 `seed + scenario + round` 内交换 10 个 Agent 的社会特征。
 - 所有 MI 以 bits 表示；`bias_corrected_bits = observed - permutation_null_mean`，允许为负。
@@ -1119,7 +1176,7 @@ def render_readme(quality: Mapping[str, Any], settings: Mapping[str, Any]) -> st
 
 ## 重要边界
 
-本目录包含真实 T+5 标签，只能用于离线评估和训练场景内筛选，不能输入预测 Agent。三个 seed 不是独立市场样本；正式验证必须按 `scenario_id` 分组。离线移除 Agent 不会重建社会网络，因此不能替代 K=8/K=6 的真实重跑。
+本目录包含真实 T+5 标签，只能用于离线评估和训练场景内筛选，不能输入预测 Agent。{seed_count} 个 seed 不是独立市场样本；正式验证必须按 `scenario_id` 分组。离线移除 Agent 不会重建社会网络，因此不能替代 K=8/K=6 的真实重跑。
 
 用于 Agent 节点优化的图应从 `merged_interaction_edges.csv` 构造，并筛选 `actor_class=investor`、`target_class=investor`。指向 source 的边和 feed 可见机会应分别建层，不得合并解释为 Agent 间影响。
 
@@ -1174,6 +1231,7 @@ def build_dataset(
     snapshots = tables["belief_snapshots.csv"]
     invalid = snapshots.loc[snapshots["status"].astype(str) != "ok"]
     seeds = sorted(int(value) for value in snapshots["seed"].unique())
+    seed_count = len(seeds)
     key_specs = {
         "snapshots": (snapshots, ["seed", "scenario_id", "round", "agent_id"]),
         "panel": (panel, ["seed", "scenario_id", "round", "agent_id"]),
@@ -1183,12 +1241,46 @@ def build_dataset(
         name: int(frame.duplicated(keys).sum())
         for name, (frame, keys) in key_specs.items()
     }
+    actual_labels = observations[["scenario_id", "actual_direction"]].drop_duplicates()
     actual_counts = (
-        observations[["scenario_id", "actual_direction"]]
-        .drop_duplicates()
+        actual_labels
         .groupby("scenario_id")["actual_direction"]
         .nunique()
     )
+    actual_direction_counts = {
+        str(direction): int(count)
+        for direction, count in actual_labels["actual_direction"].value_counts().items()
+    }
+    constant_actual_majority_accuracy = (
+        max(actual_direction_counts.values()) / len(actual_labels)
+    )
+    interaction_edges = tables["interaction_edges.csv"].copy()
+    investor_interactions = interaction_edges.loc[
+        interaction_edges["actor_class"].astype(str).eq("investor")
+        & interaction_edges["target_class"].astype(str).eq("investor")
+    ].copy()
+    degree_rows: list[dict[str, int]] = []
+    for seed, seed_edges in investor_interactions.groupby("seed", sort=True):
+        for agent_id in range(AGENT_COUNT):
+            degree_rows.append(
+                {
+                    "seed": int(seed),
+                    "agent_id": agent_id,
+                    "out_degree": int((seed_edges["actor_agent_id"] == agent_id).sum()),
+                    "in_degree": int((seed_edges["target_agent_id"] == agent_id).sum()),
+                }
+            )
+    degree_frame = pd.DataFrame(degree_rows)
+
+    def mean_degree_rank_spearman(metric: str) -> float:
+        pivot = degree_frame.pivot(index="agent_id", columns="seed", values=metric)
+        correlations = pivot.corr(method="spearman")
+        values = [
+            float(correlations.iloc[left, right])
+            for left in range(len(correlations.columns))
+            for right in range(left + 1, len(correlations.columns))
+        ]
+        return float(np.mean(values))
     exposure_validation = tables["agent_round_content_exposures.csv"].copy()
     exposure_validation["is_self_authored"] = (
         exposure_validation["is_self_authored"]
@@ -1256,6 +1348,11 @@ def build_dataset(
         "round_metric_count": len(tables["round_metrics.csv"]),
         "duplicate_key_counts": duplicate_counts,
         "actual_label_conflict_count": int((actual_counts != 1).sum()),
+        "actual_direction_counts": actual_direction_counts,
+        "constant_actual_majority_accuracy": constant_actual_majority_accuracy,
+        "investor_interaction_count": len(investor_interactions),
+        "mean_out_degree_rank_spearman": mean_degree_rank_spearman("out_degree"),
+        "mean_in_degree_rank_spearman": mean_degree_rank_spearman("in_degree"),
         "contribution_agent_count": len(contributions),
         "pair_count": len(pair_metrics),
         "seed_rank_stability_row_count": len(rank_stability),
@@ -1264,20 +1361,22 @@ def build_dataset(
             for metric, rows in rank_stability.groupby("metric", sort=True)
         },
     }
+    rank_metric_count = int(rank_stability["metric"].nunique())
+    expected_rank_stability_rows = rank_metric_count * math.comb(seed_count, 2)
     quality["passed"] = all(
         (
-            seeds == [42, 3407, 4004],
-            quality["scenario_seed_count"] == 3 * SCENARIO_COUNT,
-            quality["snapshot_count"] == 3 * SCENARIO_COUNT * (MAX_ROUND + 1) * AGENT_COUNT,
+            seeds == list(EXPECTED_SEEDS),
+            quality["scenario_seed_count"] == seed_count * SCENARIO_COUNT,
+            quality["snapshot_count"] == seed_count * SCENARIO_COUNT * (MAX_ROUND + 1) * AGENT_COUNT,
             quality["valid_snapshot_count"] >= quality["snapshot_count"] - 1,
-            quality["panel_count"] == 3 * SCENARIO_COUNT * MAX_ROUND * AGENT_COUNT,
-            quality["final_observation_count"] == 3 * SCENARIO_COUNT * AGENT_COUNT,
-            quality["round_metric_count"] == 3 * (MAX_ROUND + 1),
+            quality["panel_count"] == seed_count * SCENARIO_COUNT * MAX_ROUND * AGENT_COUNT,
+            quality["final_observation_count"] == seed_count * SCENARIO_COUNT * AGENT_COUNT,
+            quality["round_metric_count"] == seed_count * (MAX_ROUND + 1),
             not any(duplicate_counts.values()),
             quality["actual_label_conflict_count"] == 0,
             quality["contribution_agent_count"] == AGENT_COUNT,
             quality["pair_count"] == AGENT_COUNT * (AGENT_COUNT - 1) // 2,
-            quality["seed_rank_stability_row_count"] == 18,
+            quality["seed_rank_stability_row_count"] == expected_rank_stability_rows,
             quality["social_self_exposure_leak_count"] == 0,
         )
     )
@@ -1304,7 +1403,7 @@ def build_dataset(
         {"analysis_version": ANALYSIS_VERSION, "sources": provenance},
     )
 
-    report = render_report(contributions, quality)
+    report = render_report(contributions, quality, tables["round_metrics.csv"])
     (output_dir / "analysis_report.md").write_text(report, encoding="utf-8")
     (output_dir / "README.md").write_text(
         render_readme(quality, settings), encoding="utf-8"

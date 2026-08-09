@@ -53,6 +53,9 @@ def prepare_s1_reddit():
                 "sampling_method", S1ExperimentService.DEFAULT_SAMPLING_METHOD
             ),
             random_seed=data.get("random_seed"),
+            selected_full_population_agent_ids=data.get(
+                "selected_full_population_agent_ids"
+            ),
         )
         return jsonify({"success": True, "data": result})
     except (DatasetValidationError, FileNotFoundError, ValueError) as error:
@@ -91,6 +94,9 @@ def prepare_s1_reddit_batch():
                 "sampling_method", S1ExperimentService.DEFAULT_SAMPLING_METHOD
             ),
             random_seed=data.get("random_seed"),
+            selected_full_population_agent_ids=data.get(
+                "selected_full_population_agent_ids"
+            ),
         )
         return jsonify({"success": True, "data": result})
     except (DatasetValidationError, FileNotFoundError, ValueError) as error:
