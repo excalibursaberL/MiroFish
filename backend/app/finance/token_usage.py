@@ -25,6 +25,8 @@ AGENT_TOKEN_USAGE_FIELDS = (
     "agent_role",
     "agent_role_category",
     "agent_role_label",
+    "agent_skill_names",
+    "agent_skill_bundle_hash",
     "model",
     "api_call_count",
     "usage_available_call_count",
@@ -151,6 +153,12 @@ def summarize_agent_token_usage(
                 "agent_role": profile.get("role_id", "investor"),
                 "agent_role_category": profile.get("role_category", ""),
                 "agent_role_label": profile.get("role_label", ""),
+                "agent_skill_names": "|".join(
+                    str(name) for name in profile.get("finance_skill_names", [])
+                ),
+                "agent_skill_bundle_hash": profile.get(
+                    "finance_skill_bundle_hash", ""
+                ),
                 "model": "|".join(sorted(models)),
                 "api_call_count": call_count,
                 "usage_available_call_count": available_count,

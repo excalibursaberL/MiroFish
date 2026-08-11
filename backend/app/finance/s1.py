@@ -46,6 +46,13 @@ from .roles import (
     profile_prompt_text,
 )
 from .source_resolver import FinanceEventSourceResolver
+from .skill_registry import (
+    FINANCE_SKILL_STAGE_PRE_SOCIAL_ONLY,
+    finance_skill_manifest,
+    normalize_finance_skill_names,
+    normalize_finance_skill_stage,
+    normalize_finance_skill_scope,
+)
 from .token_usage import AGENT_TOKEN_USAGE_FIELDS, summarize_agent_token_usage
 
 
@@ -102,6 +109,8 @@ class S1ExperimentService:
         "agent_risk_attitude",
         "agent_investment_horizon",
         "profile_version",
+        "agent_skill_names",
+        "agent_skill_bundle_hash",
         "as_of",
         "horizon",
         "direction",
@@ -195,6 +204,8 @@ class S1ExperimentService:
         "agent_risk_attitude",
         "agent_investment_horizon",
         "profile_version",
+        "agent_skill_names",
+        "agent_skill_bundle_hash",
         "as_of",
         "horizon",
         "direction",
@@ -344,9 +355,40 @@ class S1ExperimentService:
         return summary
 
     @staticmethod
+    def _build_stage_skill_prompt(
+        prompt: str,
+        profile: Dict[str, Any],
+        *,
+        finance_skill_stage: str,
+    ) -> str:
+        """Attach a Skill only to the requested forecast stage.
+
+        For ``all_stages`` the Skill already lives in the OASIS persona, so
+        the interview prompt remains unchanged.  The pre-social-only
+        ablation deliberately keeps the persona neutral and appends the
+        assigned Skill to the initial private forecast only.
+        """
+        if finance_skill_stage != FINANCE_SKILL_STAGE_PRE_SOCIAL_ONLY:
+            return prompt
+        skill_prompt = str(profile.get("finance_skill_prompt") or "").strip()
+        if not skill_prompt:
+            return prompt
+        skill_names = ", ".join(profile.get("finance_skill_names") or [])
+        return (
+            f"{prompt}\n\n## Pre-social finance Skill (ablation)\n"
+            f"Skill IDs: {skill_names}\n"
+            "Apply this method only to the initial private forecast; it is "
+            "not available during social actions or later belief snapshots.\n\n"
+            f"{skill_prompt}"
+        )
+
+    @staticmethod
     def _s1_investor_profiles(
         scenario: FinancialScenario,
         selected_full_population_agent_ids: Optional[Sequence[int]] = None,
+        enabled_finance_skills: Optional[Sequence[str]] = None,
+        finance_skill_scope: Optional[str] = None,
+        finance_skill_stage: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         history_lines = [
             f"{index}. [{event.get('event_id')} | {event.get('event_time')}] "
@@ -355,11 +397,22 @@ class S1ExperimentService:
         ]
         history_memory = "\n".join(history_lines)
         profiles = []
+        include_finance_skill = (
+            normalize_finance_skill_stage(finance_skill_stage)
+            != FINANCE_SKILL_STAGE_PRE_SOCIAL_ONLY
+        )
         selected_ids = normalize_selected_agent_ids(
             selected_full_population_agent_ids
         )
-        for profile in build_c0_profiles(selected_ids):
-            role_text = profile_prompt_text(profile)
+        for profile in build_c0_profiles(
+            selected_ids,
+            enabled_finance_skills=enabled_finance_skills,
+            finance_skill_scope=finance_skill_scope,
+        ):
+            role_text = profile_prompt_text(
+                profile,
+                include_finance_skill=include_finance_skill,
+            )
             persona = (
                 f"你是{profile['role_label']}，编号为{profile['agent_key']}。"
                 f"{profile['role_description']}\n固定行为画像：\n{role_text}\n"
@@ -494,6 +547,9 @@ class S1ExperimentService:
         random_seed: Optional[int] = None,
         profile_id_permutation: Optional[Sequence[int]] = None,
         selected_full_population_agent_ids: Optional[Sequence[int]] = None,
+        enabled_finance_skills: Optional[Sequence[str]] = None,
+        finance_skill_scope: Optional[str] = None,
+        finance_skill_stage: Optional[str] = None,
     ) -> Dict[str, Any]:
         if isinstance(social_rounds, bool) or not isinstance(social_rounds, int):
             raise ValueError("social_rounds must be an integer")
@@ -545,9 +601,17 @@ class S1ExperimentService:
         resolved_selected_agent_ids = normalize_selected_agent_ids(
             selected_full_population_agent_ids
         )
+        enabled_finance_skills = normalize_finance_skill_names(
+            enabled_finance_skills
+        )
+        finance_skill_scope = normalize_finance_skill_scope(finance_skill_scope)
+        finance_skill_stage = normalize_finance_skill_stage(finance_skill_stage)
         canonical_investors = self._s1_investor_profiles(
             scenario,
             resolved_selected_agent_ids,
+            enabled_finance_skills,
+            finance_skill_scope,
+            finance_skill_stage,
         )
         selected_full_population_agent_ids = [
             int(profile["full_population_agent_id"])
@@ -579,6 +643,22 @@ class S1ExperimentService:
         belief_measurement_retry_prompt = self.build_belief_snapshot_retry_prompt(
             scenario
         )
+        pre_social_prompts = {
+            int(profile["user_id"]): self._build_stage_skill_prompt(
+                belief_measurement_prompt,
+                profile,
+                finance_skill_stage=finance_skill_stage,
+            )
+            for profile in investors
+        }
+        pre_social_retry_prompts = {
+            int(profile["user_id"]): self._build_stage_skill_prompt(
+                belief_measurement_retry_prompt,
+                profile,
+                finance_skill_stage=finance_skill_stage,
+            )
+            for profile in investors
+        }
         run_dir.mkdir(parents=True, exist_ok=True)
         simulation_id = f"finance_{run_id[3:]}"
         total_rounds = social_rounds
@@ -608,6 +688,12 @@ class S1ExperimentService:
                     "agent_class": profile.get("agent_class", "source"),
                     "full_population_agent_id": profile.get(
                         "full_population_agent_id"
+                    ),
+                    "finance_skill_names": list(
+                        profile.get("finance_skill_names") or []
+                    ),
+                    "finance_skill_bundle_hash": profile.get(
+                        "finance_skill_bundle_hash", ""
                     ),
                     "activity_level": 1.0 if is_investor else 0.0,
                     "active_hours": list(range(24)) if is_investor else [],
@@ -652,6 +738,12 @@ class S1ExperimentService:
                         "full_population_agent_id": int(
                             profile["full_population_agent_id"]
                         ),
+                        "skill_names": list(
+                            profile.get("finance_skill_names") or []
+                        ),
+                        "skill_bundle_hash": profile.get(
+                            "finance_skill_bundle_hash", ""
+                        ),
                     }
                     for profile in investors
                 ],
@@ -663,8 +755,10 @@ class S1ExperimentService:
                 "pre_social_interviews": [
                     {
                         "agent_id": int(profile["user_id"]),
-                        "prompt": belief_measurement_prompt,
-                        "retry_prompt": belief_measurement_retry_prompt,
+                        "prompt": pre_social_prompts[int(profile["user_id"])],
+                        "retry_prompt": pre_social_retry_prompts[
+                            int(profile["user_id"])
+                        ],
                     }
                     for profile in investors
                 ],
@@ -679,6 +773,11 @@ class S1ExperimentService:
                 "belief_snapshot_enabled": True,
                 "anonymous": True,
                 "prompt_version": self.PROMPT_VERSION,
+                "enabled_finance_skills": list(enabled_finance_skills),
+                "finance_skill_stage": finance_skill_stage,
+                "finance_skills": finance_skill_manifest(
+                    enabled_finance_skills
+                ),
             },
         }
         prompt_hash = self._sha256_json(
@@ -687,10 +786,23 @@ class S1ExperimentService:
                 "runtime_agent_mapping": config["finance_s1"][
                     "investor_agent_mapping"
                 ],
+                "investor_personas": [
+                    {
+                        "agent_id": int(profile["user_id"]),
+                        "persona": profile.get("persona", ""),
+                        "skill_names": list(
+                            profile.get("finance_skill_names") or []
+                        ),
+                        "skill_bundle_hash": profile.get(
+                            "finance_skill_bundle_hash", ""
+                        ),
+                    }
+                    for profile in investors
+                ],
                 "belief_measurement": [
                     {
                         "agent_id": int(profile["user_id"]),
-                        "prompt": belief_measurement_prompt,
+                        "prompt": pre_social_prompts[int(profile["user_id"])],
                     }
                     for profile in investors
                 ],
@@ -741,6 +853,26 @@ class S1ExperimentService:
             "prompt_version": self.PROMPT_VERSION,
             "prompt_hash": prompt_hash,
             "random_seed": random_seed,
+            "enabled_finance_skills": list(enabled_finance_skills),
+            "finance_skill_scope": finance_skill_scope,
+            "finance_skill_stage": finance_skill_stage,
+            "finance_skills": finance_skill_manifest(enabled_finance_skills),
+            "profile_skill_assignments": [
+                {
+                    "agent_id": int(profile["user_id"]),
+                    "canonical_agent_id": int(profile["canonical_agent_id"]),
+                    "full_population_agent_id": int(
+                        profile["full_population_agent_id"]
+                    ),
+                    "skill_names": list(
+                        profile.get("finance_skill_names") or []
+                    ),
+                    "skill_bundle_hash": profile.get(
+                        "finance_skill_bundle_hash", ""
+                    ),
+                }
+                for profile in investors
+            ],
             "group": self.GROUP,
             "platform": self.PLATFORM,
             "simulation_id": simulation_id,
@@ -768,6 +900,12 @@ class S1ExperimentService:
                     "canonical_agent_id": int(profile["canonical_agent_id"]),
                     "full_population_agent_id": int(
                         profile["full_population_agent_id"]
+                    ),
+                    "skill_names": list(
+                        profile.get("finance_skill_names") or []
+                    ),
+                    "skill_bundle_hash": profile.get(
+                        "finance_skill_bundle_hash", ""
                     ),
                 }
                 for profile in investors
@@ -1573,6 +1711,12 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
                     "agent_role": profile.get("role_id", "investor"),
                     "agent_role_category": profile.get("role_category", ""),
                     "agent_role_label": profile.get("role_label", ""),
+                    "agent_skill_names": list(
+                        profile.get("finance_skill_names") or []
+                    ),
+                    "agent_skill_bundle_hash": profile.get(
+                        "finance_skill_bundle_hash", ""
+                    ),
                     "as_of": scenario.prediction_cutoff,
                     "horizon": scenario.horizon,
                     "status": "missing",
@@ -1642,6 +1786,12 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
                         "agent_role": profile.get("role_id", "investor"),
                         "agent_role_category": profile.get("role_category", ""),
                         "agent_role_label": profile.get("role_label", ""),
+                        "agent_skill_names": list(
+                            profile.get("finance_skill_names") or []
+                        ),
+                        "agent_skill_bundle_hash": profile.get(
+                            "finance_skill_bundle_hash", ""
+                        ),
                         "as_of": scenario.prediction_cutoff,
                         "horizon": scenario.horizon,
                         "status": "missing",
@@ -1694,6 +1844,12 @@ expected_return 使用小数收益率，例如 0.03 表示 +3%。三个概率必
                     "agent_role": profile.get("role_id", "investor"),
                     "agent_role_category": profile.get("role_category", ""),
                     "agent_role_label": profile.get("role_label", ""),
+                    "agent_skill_names": list(
+                        profile.get("finance_skill_names") or []
+                    ),
+                    "agent_skill_bundle_hash": profile.get(
+                        "finance_skill_bundle_hash", ""
+                    ),
                     "status": "missing",
                     "error": "final-round belief snapshot is missing",
                     "evidence_event_ids": [],

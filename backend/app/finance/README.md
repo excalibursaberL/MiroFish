@@ -321,6 +321,42 @@ PyTorch 和 OASIS 随机源；DeepSeek 服务端不保证逐 token 确定性。
 该脚本不会自动执行离线内容立场标注。正式运行完成后，可针对总清单中的每个
 `s1_batch_*` 使用下一节的批次或单次标注脚本。
 
+### 异质化机构 Analyst Skill 实验
+
+机构 Analyst 已封装为仓库内 Skill：
+`backend/app/finance/skills/ashare-institutional-analyst/SKILL.md`。它是机构
+Agent 一次推理中的四个内部研究视角（事件/新闻、政策/监管、市场/资金、
+基本面/风险复核），不会创建额外的 OASIS 节点、LLM 调用或曝光边。Skill
+只允许 `role_category=institution` 的 Profile 使用，且默认关闭；没有显式
+传参的 C0、S1 和批次实验仍是原基线。Skill 正文的 SHA-256、启用列表和
+逐 Agent 分配关系会写入 `manifest.json`、`profiles.json`、提示词清单和
+预测记录，便于对照实验审计。
+
+在种子扫描中显式启用 Skill，建议先做不产生文件的配置检查：
+
+```powershell
+cd MiroFish/backend
+.venv/Scripts/python.exe scripts/run_s1_seed_sweep.py `
+  --seeds 4005 4006 `
+  --finance-skills ashare-institutional-analyst `
+  --dry-run
+```
+
+确认后去掉 `--dry-run` 即可运行同一批 18 个预构建图谱。关闭 `--finance-skills`
+就是对应的无 Skill 对照组。单场景或批次 API 使用相同字段，例如：
+
+```json
+{
+  "social_rounds": 6,
+  "enabled_finance_skills": ["ashare-institutional-analyst"]
+}
+```
+
+调用 S1 的 `/api/finance/s1/reddit/prepare` 或批次 `/batch/prepare` 时传入该
+字段即可。Skill 只改变机构 Agent 的分析提示，不改变 T+5 JSON 输出契约、
+社会互动轮数、随机种子或图谱输入；实验组仍应与关闭 Skill 的同 seed、同场景
+配置配对比较。
+
 ### Offline LLM stance annotation
 
 The social simulation does not call a second model to classify content. After

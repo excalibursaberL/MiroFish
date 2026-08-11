@@ -38,6 +38,12 @@ from app.finance.roles import (  # noqa: E402
     normalize_selected_agent_ids,
 )
 from app.finance.s1_batch import S1BatchRunner  # noqa: E402
+from app.finance.skill_registry import (  # noqa: E402
+    finance_skill_manifest,
+    normalize_finance_skill_names,
+    normalize_finance_skill_stage,
+    normalize_finance_skill_scope,
+)
 
 
 SOCIAL_ROUNDS = 6
@@ -140,6 +146,9 @@ def build_plan(
     agent_set_version: str | None = None,
     sampling_method: str | None = None,
     data_split: str | None = None,
+    enabled_finance_skills: Sequence[str] | None = None,
+    finance_skill_scope: str | None = None,
+    finance_skill_stage: str | None = None,
 ) -> dict[str, Any]:
     graphs = read_completed_graphs(graph_manifest)
     if C0_AGENT_COUNT != 10 or len(SELECTED_AGENT_IDS) != 10:
@@ -147,6 +156,11 @@ def build_plan(
             "the active finance role configuration is no longer the fixed K=10 set"
         )
     selected_ids = normalize_selected_agent_ids(selected_full_population_agent_ids)
+    enabled_finance_skills = normalize_finance_skill_names(
+        enabled_finance_skills
+    )
+    finance_skill_scope = normalize_finance_skill_scope(finance_skill_scope)
+    finance_skill_stage = normalize_finance_skill_stage(finance_skill_stage)
     agent_count = len(selected_ids)
     is_default_set = selected_ids == tuple(SELECTED_AGENT_IDS)
     resolved_agent_set_version = str(
@@ -181,6 +195,10 @@ def build_plan(
         "agent_set_version": resolved_agent_set_version,
         "sampling_method": resolved_sampling_method,
         "data_split": resolved_data_split,
+        "enabled_finance_skills": list(enabled_finance_skills),
+        "finance_skill_scope": finance_skill_scope,
+        "finance_skill_stage": finance_skill_stage,
+        "finance_skills": finance_skill_manifest(enabled_finance_skills),
         "graph_manifest_path": str(graph_manifest),
         "scenario_ids": [str(item["scenario_id"]) for item in graphs],
         "scenario_count_per_seed": len(graphs),
@@ -222,6 +240,9 @@ def create_sweep_manifest(
     agent_set_version: str | None = None,
     sampling_method: str | None = None,
     data_split: str | None = None,
+    enabled_finance_skills: Sequence[str] | None = None,
+    finance_skill_scope: str | None = None,
+    finance_skill_stage: str | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     plan = build_plan(
         seeds,
@@ -231,6 +252,9 @@ def create_sweep_manifest(
         agent_set_version=agent_set_version,
         sampling_method=sampling_method,
         data_split=data_split,
+        enabled_finance_skills=enabled_finance_skills,
+        finance_skill_scope=finance_skill_scope,
+        finance_skill_stage=finance_skill_stage,
     )
     sweep_id = f"s1_seed_sweep_{uuid.uuid4().hex[:12]}"
     if not SWEEP_ID_PATTERN.fullmatch(sweep_id):
@@ -254,6 +278,10 @@ def create_sweep_manifest(
         "agent_set_version": plan["agent_set_version"],
         "sampling_method": plan["sampling_method"],
         "data_split": plan["data_split"],
+        "enabled_finance_skills": plan["enabled_finance_skills"],
+        "finance_skill_scope": plan["finance_skill_scope"],
+        "finance_skill_stage": plan["finance_skill_stage"],
+        "finance_skills": plan["finance_skills"],
         "profile_id_permutation_enabled": permute_profile_ids,
         "graph_manifest_path": str(graph_manifest),
         "scenario_ids": list(EXPECTED_SCENARIO_IDS),
@@ -294,6 +322,9 @@ def run_sweep(
     agent_set_version: str | None = None,
     sampling_method: str | None = None,
     data_split: str | None = None,
+    enabled_finance_skills: Sequence[str] | None = None,
+    finance_skill_scope: str | None = None,
+    finance_skill_stage: str | None = None,
 ) -> dict[str, Any]:
     build_plan(
         seeds,
@@ -303,6 +334,9 @@ def run_sweep(
         agent_set_version=agent_set_version,
         sampling_method=sampling_method,
         data_split=data_split,
+        enabled_finance_skills=enabled_finance_skills,
+        finance_skill_scope=finance_skill_scope,
+        finance_skill_stage=finance_skill_stage,
     )
     sweep_dir, sweep = create_sweep_manifest(
         storage_dir=storage_dir,
@@ -313,6 +347,9 @@ def run_sweep(
         agent_set_version=agent_set_version,
         sampling_method=sampling_method,
         data_split=data_split,
+        enabled_finance_skills=enabled_finance_skills,
+        finance_skill_scope=finance_skill_scope,
+        finance_skill_stage=finance_skill_stage,
     )
     runner = S1BatchRunner(storage_dir=storage_dir)
     sweep["status"] = "running"
@@ -344,6 +381,9 @@ def run_sweep(
                 selected_full_population_agent_ids=sweep[
                     "selected_full_population_agent_ids"
                 ],
+                enabled_finance_skills=sweep["enabled_finance_skills"],
+                finance_skill_scope=sweep["finance_skill_scope"],
+                finance_skill_stage=sweep["finance_skill_stage"],
             )
             batch_id = str(prepared["batch_id"])
             entry.update(
@@ -446,6 +486,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="auditable data-split override",
     )
     parser.add_argument(
+        "--finance-skills",
+        nargs="+",
+        metavar="SKILL_ID",
+        help=(
+            "explicit heterogeneous finance Skill IDs; currently supports "
+            "ashare-institutional-analyst"
+        ),
+    )
+    parser.add_argument(
+        "--finance-skill-scope",
+        choices=("eligible_roles", "all_agents"),
+        default="eligible_roles",
+        help=(
+            "Skill assignment scope; eligible_roles preserves role gating, "
+            "all_agents assigns every investor the enabled Skill bundle"
+        ),
+    )
+    parser.add_argument(
+        "--finance-skill-stage",
+        choices=("all_stages", "pre_social_only"),
+        default="all_stages",
+        help=(
+            "when to render enabled finance Skills; pre_social_only keeps "
+            "social actions and round belief snapshots on the base persona"
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="validate and print the plan without creating files or calling an LLM",
@@ -486,6 +553,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 agent_set_version=args.agent_set_version,
                 sampling_method=args.sampling_method,
                 data_split=args.data_split,
+                enabled_finance_skills=args.finance_skills,
+                finance_skill_scope=args.finance_skill_scope,
+                finance_skill_stage=args.finance_skill_stage,
             )
         else:
             result = run_sweep(
@@ -498,6 +568,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 agent_set_version=args.agent_set_version,
                 sampling_method=args.sampling_method,
                 data_split=args.data_split,
+                enabled_finance_skills=args.finance_skills,
+                finance_skill_scope=args.finance_skill_scope,
+                finance_skill_stage=args.finance_skill_stage,
             )
         print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
         return 0 if result.get("status") in {None, "completed"} else 1

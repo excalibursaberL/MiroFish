@@ -23,6 +23,8 @@ class C0Forecast:
     agent_risk_attitude: Optional[str] = None
     agent_investment_horizon: Optional[str] = None
     profile_version: Optional[str] = None
+    agent_skill_names: List[str] = field(default_factory=list)
+    agent_skill_bundle_hash: str = ""
     direction: Optional[str] = None
     up_probability: Optional[float] = None
     neutral_probability: Optional[float] = None
@@ -54,6 +56,8 @@ class C0Forecast:
             "agent_risk_attitude": self.agent_risk_attitude,
             "agent_investment_horizon": self.agent_investment_horizon,
             "profile_version": self.profile_version,
+            "agent_skill_names": self.agent_skill_names,
+            "agent_skill_bundle_hash": self.agent_skill_bundle_hash,
             "as_of": self.as_of,
             "horizon": self.horizon,
             "direction": self.direction,

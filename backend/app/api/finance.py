@@ -56,6 +56,9 @@ def prepare_s1_reddit():
             selected_full_population_agent_ids=data.get(
                 "selected_full_population_agent_ids"
             ),
+            enabled_finance_skills=data.get("enabled_finance_skills"),
+            finance_skill_scope=data.get("finance_skill_scope"),
+            finance_skill_stage=data.get("finance_skill_stage"),
         )
         return jsonify({"success": True, "data": result})
     except (DatasetValidationError, FileNotFoundError, ValueError) as error:
@@ -97,6 +100,9 @@ def prepare_s1_reddit_batch():
             selected_full_population_agent_ids=data.get(
                 "selected_full_population_agent_ids"
             ),
+            enabled_finance_skills=data.get("enabled_finance_skills"),
+            finance_skill_scope=data.get("finance_skill_scope"),
+            finance_skill_stage=data.get("finance_skill_stage"),
         )
         return jsonify({"success": True, "data": result})
     except (DatasetValidationError, FileNotFoundError, ValueError) as error:
@@ -377,6 +383,7 @@ def prepare_c0():
                 "sampling_method", C0ExperimentService.DEFAULT_SAMPLING_METHOD
             ),
             random_seed=data.get("random_seed"),
+            enabled_finance_skills=data.get("enabled_finance_skills"),
         )
         return jsonify({"success": True, "data": result})
     except (DatasetValidationError, FileNotFoundError, ValueError) as error:

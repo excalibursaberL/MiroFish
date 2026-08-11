@@ -286,6 +286,82 @@ def test_s1_rejects_invalid_profile_id_permutation(tmp_path):
         )
 
 
+def test_s1_records_institutional_skill_assignment(monkeypatch, tmp_path):
+    simulation_dir = tmp_path / "simulations"
+    monkeypatch.setattr(SimulationManager, "SIMULATION_DATA_DIR", str(simulation_dir))
+    service = S1ExperimentService(storage_dir=tmp_path / "finance")
+    manifest = service.prepare(
+        scenario_id="SCN_009",
+        source_mode="scenario",
+        social_rounds=1,
+        enabled_finance_skills=["ashare-institutional-analyst"],
+    )
+
+    assert manifest["enabled_finance_skills"] == ["ashare-institutional-analyst"]
+    assignments = manifest["profile_skill_assignments"]
+    assert [item["full_population_agent_id"] for item in assignments if item["skill_names"]] == [1]
+    profiles = json.loads(
+        (tmp_path / "finance" / manifest["run_id"] / "profiles.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert [profile["user_id"] for profile in profiles if profile["finance_skill_names"]] == [0]
+    assert all(
+        profile["finance_skill_names"] == []
+        for profile in profiles
+        if profile["user_id"] != 0
+    )
+    config = json.loads(
+        (simulation_dir / manifest["simulation_id"] / "simulation_config.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert config["finance_s1"]["enabled_finance_skills"] == [
+        "ashare-institutional-analyst"
+    ]
+
+
+def test_s1_pre_social_only_skill_is_absent_from_social_persona_and_snapshots(
+    monkeypatch, tmp_path
+):
+    simulation_dir = tmp_path / "simulations"
+    monkeypatch.setattr(SimulationManager, "SIMULATION_DATA_DIR", str(simulation_dir))
+    service = S1ExperimentService(storage_dir=tmp_path / "finance")
+    manifest = service.prepare(
+        scenario_id="SCN_009",
+        source_mode="scenario",
+        social_rounds=2,
+        enabled_finance_skills=["ashare-institutional-analyst"],
+        finance_skill_scope="eligible_roles",
+        finance_skill_stage="pre_social_only",
+    )
+
+    assert manifest["finance_skill_stage"] == "pre_social_only"
+    assert [
+        item["full_population_agent_id"]
+        for item in manifest["profile_skill_assignments"]
+        if item["skill_names"]
+    ] == [1]
+    run_profiles = json.loads(
+        (tmp_path / "finance" / manifest["run_id"] / "profiles.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "Enabled heterogeneous finance Skill" not in run_profiles[0]["persona"]
+    assert "Enabled heterogeneous finance Skill" not in run_profiles[1]["persona"]
+
+    config = json.loads(
+        (simulation_dir / manifest["simulation_id"] / "simulation_config.json")
+        .read_text(encoding="utf-8")
+    )
+    pre = config["finance_s1"]["pre_social_interviews"]
+    snapshots = config["finance_s1"]["round_belief_snapshot_interviews"]
+    assert config["finance_s1"]["finance_skill_stage"] == "pre_social_only"
+    assert "Pre-social finance Skill (ablation)" in pre[0]["prompt"]
+    assert "Pre-social finance Skill (ablation)" not in pre[1]["prompt"]
+    assert all("Pre-social finance Skill (ablation)" not in item["prompt"] for item in snapshots)
+
+
 def test_s1_graph_mode_reuses_zep_entities_for_dynamic_source_profiles(
     monkeypatch, tmp_path
 ):

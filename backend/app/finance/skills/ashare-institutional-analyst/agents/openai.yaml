@@ -1,0 +1,6 @@
+interface:
+  display_name: "A-Share Institutional Analyst"
+  short_description: "Frozen-evidence institutional A-share analysis"
+  default_prompt: "Use $ashare-institutional-analyst to analyze a frozen A-share event scenario through institutional research desks."
+policy:
+  allow_implicit_invocation: false

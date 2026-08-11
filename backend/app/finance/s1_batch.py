@@ -15,6 +15,12 @@ from ..utils.logger import get_logger
 from .dataset import FinancialDatasetLoader, PROJECT_ROOT
 from .roles import normalize_selected_agent_ids
 from .s1 import S1ExperimentService
+from .skill_registry import (
+    finance_skill_manifest,
+    normalize_finance_skill_names,
+    normalize_finance_skill_stage,
+    normalize_finance_skill_scope,
+)
 
 
 logger = get_logger("mirofish.finance.s1_batch")
@@ -92,6 +98,9 @@ class S1BatchRunner:
         random_seed: Optional[int] = None,
         profile_id_permutation: Optional[Sequence[int]] = None,
         selected_full_population_agent_ids: Optional[Sequence[int]] = None,
+        enabled_finance_skills: Optional[Sequence[str]] = None,
+        finance_skill_scope: Optional[str] = None,
+        finance_skill_stage: Optional[str] = None,
     ) -> Dict[str, Any]:
         if isinstance(social_rounds, bool) or not isinstance(social_rounds, int):
             raise ValueError("social_rounds must be an integer")
@@ -115,6 +124,11 @@ class S1BatchRunner:
         resolved_selected_agent_ids = normalize_selected_agent_ids(
             selected_full_population_agent_ids
         )
+        enabled_finance_skills = normalize_finance_skill_names(
+            enabled_finance_skills
+        )
+        finance_skill_scope = normalize_finance_skill_scope(finance_skill_scope)
+        finance_skill_stage = normalize_finance_skill_stage(finance_skill_stage)
         investor_agent_count = len(resolved_selected_agent_ids)
         resolved_profile_id_permutation = (
             list(range(investor_agent_count))
@@ -174,6 +188,10 @@ class S1BatchRunner:
             "selected_full_population_agent_ids": list(
                 resolved_selected_agent_ids
             ),
+            "enabled_finance_skills": list(enabled_finance_skills),
+            "finance_skill_scope": finance_skill_scope,
+            "finance_skill_stage": finance_skill_stage,
+            "finance_skills": finance_skill_manifest(enabled_finance_skills),
             "scenario_count": len(completed),
             "completed_scenario_count": 0,
             "failed_scenario_count": 0,
@@ -352,6 +370,15 @@ class S1BatchRunner:
                         ),
                         selected_full_population_agent_ids=manifest.get(
                             "selected_full_population_agent_ids"
+                        ),
+                        enabled_finance_skills=manifest.get(
+                            "enabled_finance_skills"
+                        ),
+                        finance_skill_scope=manifest.get(
+                            "finance_skill_scope"
+                        ),
+                        finance_skill_stage=manifest.get(
+                            "finance_skill_stage"
                         ),
                     )
                     item.update(

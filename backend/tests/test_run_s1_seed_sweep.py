@@ -102,6 +102,43 @@ def test_build_plan_supports_preferred_k8_candidate(tmp_path):
     assert plan["profile_id_permutations"]["42"] == list(range(8))
 
 
+def test_build_plan_records_explicit_finance_skill(tmp_path):
+    plan = seed_sweep.build_plan(
+        [42],
+        graph_manifest(tmp_path),
+        enabled_finance_skills=["ashare-institutional-analyst"],
+    )
+
+    assert plan["enabled_finance_skills"] == ["ashare-institutional-analyst"]
+    assert plan["finance_skills"][0]["name"] == "ashare-institutional-analyst"
+
+
+def test_build_plan_records_all_agent_finance_skill_scope(tmp_path):
+    plan = seed_sweep.build_plan(
+        [42, 999, 4004],
+        graph_manifest(tmp_path),
+        enabled_finance_skills=["ashare-institutional-analyst"],
+        finance_skill_scope="all_agents",
+    )
+
+    assert plan["finance_skill_scope"] == "all_agents"
+    assert plan["agent_count"] == 10
+    assert plan["total_scenario_runs"] == 54
+
+
+def test_build_plan_records_pre_social_only_finance_skill_stage(tmp_path):
+    plan = seed_sweep.build_plan(
+        [42],
+        graph_manifest(tmp_path),
+        enabled_finance_skills=["ashare-institutional-analyst"],
+        finance_skill_scope="eligible_roles",
+        finance_skill_stage="pre_social_only",
+    )
+
+    assert plan["finance_skill_scope"] == "eligible_roles"
+    assert plan["finance_skill_stage"] == "pre_social_only"
+
+
 def test_run_sweep_creates_one_serial_batch_per_seed(monkeypatch, tmp_path):
     prepared = []
 
@@ -220,3 +257,40 @@ def test_run_sweep_propagates_k8_candidate(monkeypatch, tmp_path):
     assert prepared[0]["profile_id_permutation"] == list(range(8))
     assert prepared[0]["agent_set_version"] == "n10_k8_enum_best_v1"
     assert prepared[0]["data_split"] == "agent_subset_rerun_validation"
+
+
+def test_run_sweep_propagates_finance_skill(monkeypatch, tmp_path):
+    prepared = []
+
+    class FakeRunner:
+        def __init__(self, *, storage_dir):
+            self.storage_dir = storage_dir
+
+        def prepare(self, **kwargs):
+            prepared.append(kwargs)
+            batch_id = "s1_batch_skilltest"
+            batch_dir = self.storage_dir / batch_id
+            batch_dir.mkdir()
+            (batch_dir / "manifest.json").write_text("{}", encoding="utf-8")
+            return {"batch_id": batch_id}
+
+        def run_sync(self, batch_id):
+            return {
+                "batch_id": batch_id,
+                "status": "completed",
+                "completed_scenario_count": 18,
+                "failed_scenario_count": 0,
+            }
+
+    monkeypatch.setattr(seed_sweep, "S1BatchRunner", FakeRunner)
+    result = seed_sweep.run_sweep(
+        seeds=[42],
+        graph_manifest=graph_manifest(tmp_path),
+        storage_dir=tmp_path / "finance",
+        enabled_finance_skills=["ashare-institutional-analyst"],
+    )
+
+    assert result["status"] == "completed"
+    assert prepared[0]["enabled_finance_skills"] == [
+        "ashare-institutional-analyst"
+    ]

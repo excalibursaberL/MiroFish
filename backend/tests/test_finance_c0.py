@@ -219,6 +219,29 @@ def test_prepare_and_dry_run_do_not_call_llm(tmp_path):
     assert preview["prompt"]["agent_id"] == 0
 
 
+def test_prepare_records_institutional_skill_assignment_without_changing_baseline(
+    tmp_path,
+):
+    service = C0ExperimentService(storage_dir=tmp_path)
+    manifest = service.prepare(
+        limit=1,
+        enabled_finance_skills=["ashare-institutional-analyst"],
+    )
+
+    assert manifest["enabled_finance_skills"] == ["ashare-institutional-analyst"]
+    assert manifest["finance_skills"][0]["name"] == "ashare-institutional-analyst"
+    assignments = manifest["profile_skill_assignments"]
+    assert [item["agent_id"] for item in assignments if item["skill_names"]] == [0]
+    prompt_lines = (
+        tmp_path / manifest["run_id"] / "prompts.jsonl"
+    ).read_text(encoding="utf-8").splitlines()
+    assert "## Enabled heterogeneous finance Skill" in prompt_lines[0]
+    assert all(
+        "## Enabled heterogeneous finance Skill" not in line
+        for line in prompt_lines[1:]
+    )
+
+
 def test_c0_prototype_rejects_multiple_scenarios(tmp_path):
     service = C0ExperimentService(storage_dir=tmp_path)
     with pytest.raises(ValueError, match="一个场景"):

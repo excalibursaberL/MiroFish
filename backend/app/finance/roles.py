@@ -17,6 +17,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
+from .skill_registry import (
+    assign_finance_skills,
+    normalize_finance_skill_scope,
+)
+
 
 FULL_AGENT_COUNT = 20
 SELECTED_AGENT_IDS = (1, 3, 4, 5, 9, 11, 12, 13, 14, 17)
@@ -277,9 +282,18 @@ def iter_c0_roles() -> List[Dict[str, Any]]:
     return roles
 
 
-def profile_prompt_text(profile: Dict[str, Any]) -> str:
-    """Render only the stable C0 fields into a compact prompt section."""
-    return (
+def profile_prompt_text(
+    profile: Dict[str, Any],
+    *,
+    include_finance_skill: bool = True,
+) -> str:
+    """Render stable profile fields, optionally omitting the Skill body.
+
+    S1's pre-social-only Skill ablation keeps the assigned Skill metadata but
+    builds the OASIS persona from the base profile.  The Skill is then added
+    explicitly to the pre-social interview prompt only.
+    """
+    text = (
         "- 知识水平：{knowledge}\n"
         "- 分析方式：{analysis}\n"
         "- 分析规则：{analysis_guidance}\n"
@@ -296,9 +310,27 @@ def profile_prompt_text(profile: Dict[str, Any]) -> str:
         risk=_RISK_LABELS[profile["risk_attitude"]],
         horizon=_HORIZON_LABELS[profile["investment_horizon"]],
     )
+    skill_prompt = (
+        str(profile.get("finance_skill_prompt") or "").strip()
+        if include_finance_skill
+        else ""
+    )
+    if skill_prompt:
+        skill_names = ", ".join(profile.get("finance_skill_names") or [])
+        text += (
+            "\n\n## Enabled heterogeneous finance Skill\n"
+            f"Skill IDs: {skill_names}\n"
+            "Apply the following role-specific method while preserving every "
+            "experiment information boundary and the common output contract.\n\n"
+            f"{skill_prompt}"
+        )
+    return text
 
 
-def build_full_c0_profiles() -> List[Dict[str, Any]]:
+def build_full_c0_profiles(
+    enabled_finance_skills: Optional[Sequence[str]] = None,
+    finance_skill_scope: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Create the auditable 20-Agent source pool used by subset selection."""
     profiles: List[Dict[str, Any]] = []
     for role in iter_c0_roles():
@@ -359,7 +391,15 @@ def build_full_c0_profiles() -> List[Dict[str, Any]]:
                 "profile_sources": profile_sources,
             }
         )
-    return profiles
+    scope = normalize_finance_skill_scope(finance_skill_scope)
+    return [
+        assign_finance_skills(
+            profile,
+            enabled_finance_skills,
+            finance_skill_scope=scope,
+        )
+        for profile in profiles
+    ]
 
 
 def normalize_selected_agent_ids(
@@ -386,12 +426,17 @@ def normalize_selected_agent_ids(
 
 def build_c0_profiles(
     selected_full_population_agent_ids: Optional[Sequence[int]] = None,
+    enabled_finance_skills: Optional[Sequence[str]] = None,
+    finance_skill_scope: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return selected source-pool profiles with contiguous runtime IDs."""
     selected_ids = normalize_selected_agent_ids(selected_full_population_agent_ids)
     full_profiles = {
         int(profile["full_population_agent_id"]): profile
-        for profile in build_full_c0_profiles()
+        for profile in build_full_c0_profiles(
+            enabled_finance_skills,
+            finance_skill_scope=finance_skill_scope,
+        )
     }
     profiles: List[Dict[str, Any]] = []
     for runtime_id, full_population_agent_id in enumerate(selected_ids):

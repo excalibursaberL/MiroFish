@@ -45,6 +45,10 @@ from .roles import (
     build_c0_profiles,
     profile_prompt_text,
 )
+from .skill_registry import (
+    finance_skill_manifest,
+    normalize_finance_skill_names,
+)
 from .token_usage import (
     AGENT_TOKEN_USAGE_FIELDS,
     normalize_token_usage,
@@ -64,6 +68,8 @@ def _forecast_profile_fields(profile: Dict[str, Any]) -> Dict[str, Any]:
         "agent_risk_attitude": profile.get("risk_attitude"),
         "agent_investment_horizon": profile.get("investment_horizon"),
         "profile_version": profile.get("profile_version"),
+        "agent_skill_names": list(profile.get("finance_skill_names") or []),
+        "agent_skill_bundle_hash": profile.get("finance_skill_bundle_hash", ""),
     }
 
 
@@ -110,6 +116,8 @@ class C0ExperimentService:
         "agent_risk_attitude",
         "agent_investment_horizon",
         "profile_version",
+        "agent_skill_names",
+        "agent_skill_bundle_hash",
         "as_of",
         "horizon",
         "direction",
@@ -173,6 +181,7 @@ class C0ExperimentService:
         agent_set_version: Optional[str] = None,
         sampling_method: str = DEFAULT_SAMPLING_METHOD,
         random_seed: Optional[int] = None,
+        enabled_finance_skills: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
         """Freeze scenarios, roles, and prompts without calling the LLM."""
         if run_mode not in self.RUN_MODES:
@@ -206,12 +215,17 @@ class C0ExperimentService:
         data_split = str(data_split or self.DEFAULT_DATA_SPLIT)
         agent_set_version = str(agent_set_version or self.DEFAULT_AGENT_SET_VERSION)
         sampling_method = str(sampling_method or self.DEFAULT_SAMPLING_METHOD)
+        enabled_finance_skills = normalize_finance_skill_names(
+            enabled_finance_skills
+        )
         run_dir = self._run_dir(run_id)
         if run_dir.exists() and any(run_dir.iterdir()):
             raise ValueError(f"C0 run already exists: {run_id}")
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        profiles = build_c0_profiles()
+        profiles = build_c0_profiles(
+            enabled_finance_skills=enabled_finance_skills
+        )
         if len(profiles) != C0_AGENT_COUNT:
             raise RuntimeError("C0 profile count does not match role configuration")
 
@@ -234,6 +248,12 @@ class C0ExperimentService:
                             "full_population_agent_id"
                         ],
                         "agent_role": profile["role_id"],
+                        "agent_skill_names": list(
+                            profile.get("finance_skill_names") or []
+                        ),
+                        "agent_skill_bundle_hash": profile.get(
+                            "finance_skill_bundle_hash", ""
+                        ),
                         "system": system_prompt,
                         "user": user_prompt,
                     }
@@ -259,6 +279,7 @@ class C0ExperimentService:
             "prompt_version": self.PROMPT_VERSION,
             "prompt_hash": prompt_hash,
             "random_seed": random_seed,
+            "enabled_finance_skills": list(enabled_finance_skills),
         }
         for record in prompt_records:
             record.update(prompt_metadata)
@@ -274,6 +295,23 @@ class C0ExperimentService:
             "prompt_version": self.PROMPT_VERSION,
             "prompt_hash": prompt_hash,
             "random_seed": random_seed,
+            "enabled_finance_skills": list(enabled_finance_skills),
+            "finance_skills": finance_skill_manifest(enabled_finance_skills),
+            "profile_skill_assignments": [
+                {
+                    "agent_id": int(profile["user_id"]),
+                    "full_population_agent_id": int(
+                        profile["full_population_agent_id"]
+                    ),
+                    "skill_names": list(
+                        profile.get("finance_skill_names") or []
+                    ),
+                    "skill_bundle_hash": profile.get(
+                        "finance_skill_bundle_hash", ""
+                    ),
+                }
+                for profile in profiles
+            ],
             "group": self.GROUP,
             "run_mode": run_mode,
             "social_interaction": False,
